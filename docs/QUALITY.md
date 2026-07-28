@@ -489,3 +489,81 @@ tested escapes the frontier.
 
 Reproduce with `gpudct eval --profile balanced --qamp A --qshape B`; `--qamp`
 and the `--profile` narrowing of `eval` exist for this sweep.
+
+### Profiling the encoder, again: the remainder was 60% of the time
+
+The lesson from the previous round -- that a stage timer covering only the
+kernels sends optimization at the wrong stage -- was recorded but not fully
+applied. The CUDA timers still measured only kernel spans, so they accounted for
+**40% of decode and 32% of encode**, and the rest was invisible. `StageTimer` now
+carries a host wall clock and prints an explicit `unaccounted` column, so the
+report can be checked against its own total instead of believed.
+
+The corrected profile, 1024^3 at quality 1.0, per gigabyte:
+
+| decode | ms | encode | ms |
+|---|---|---|---|
+| readback | 92 | **tables (host clustering)** | **231** |
+| host prep | 54 | ke2b (rANS) | 138 |
+| k1 (entropy) | 45 | ke2a (symbols) | 48 |
+| unaccounted | 46 | payload assembly | 33 |
+| k2 (transform) | 11 | ke1 (transform) | 11 |
+
+The kernels are **22% of decode and 6% of encode**. Every intuition about where
+to optimize this codec on the GPU was wrong: K1 and K2 are not the problem, and
+neither is the transform. Encode is host clustering; decode is transfer and
+per-batch host preparation.
+
+### An exact logarithm that is also fast
+
+Clustering was the largest single cost in encode, and essentially all of it was
+`std::log2`. The approximate logarithm rejected earlier (-1.8% BD-rate) was
+solving the right problem the wrong way. Two exact changes:
+
+- `-log2(c/total)` is `log2(total) - log2(c)`. The first term is loop-invariant,
+  and the second is the logarithm of an *integer count* -- so it can be looked up
+  in a precomputed table holding exactly what `std::log2` returns.
+- `merge_delta` allocated a vector and walked the 256-symbol alphabet six times
+  (build `merged`, two `cross_entropy_bits` calls that each recompute the total,
+  then `distinct`). Wherever the merged count is nonzero both inputs pay the same
+  per-symbol cost, so their counts add before multiplying and it becomes one pass
+  with no allocation.
+
+Together: encode **977 -> 1086 MB/s**, with the golden test still passing --
+the bitstream is byte-identical. Approximation was never required; the operands
+were integers all along.
+
+### Four more things that measured nothing
+
+| change | expected | measured |
+|---|---|---|
+| overlapped slab readback on a second stream | ~25% of decode | nothing |
+| cached per-cluster totals | one fewer pass | nothing |
+| branchless merge inner loop | fewer mispredicts | indistinguishable |
+| `--streams` 16 -> 32 | large (thread starvation) | +3% decode, -0.2% ratio |
+
+The readback overlap is the interesting failure. It worked exactly as designed --
+the measured download went from 92 ms to 0.01 ms -- and bought no end-to-end time
+at all, twice, interleaved. Whatever the transfer was contending with, it was not
+on the critical path. Roughly 60 lines, a second stream, and a pinned-lifetime
+invariant were reverted for it.
+
+The stream sweep is worth keeping as a number: 4 -> 32 streams is +16% decode for
+0.3% of ratio, and 64 streams is *worse* than 32 on both. The hypothesis being
+tested was that 512 bricks x 16 streams = 8192 threads badly under-occupies the
+GPU. It does not; the codec is not parallelism-starved at this size.
+
+### Two measurement traps in the bench harness
+
+**`decode()` versus `decode_into()`.** `decode()` sizes the output with
+`std::vector::resize`, which value-initializes -- so a fresh 1 GB output costs a
+full zero-fill plus page faults, measured at more than every other decode stage
+combined. That is real for a caller who needs a new buffer, but it is allocator
+behaviour rather than codec throughput, and the API already offers `decode_into`.
+The bench now reuses one buffer. Any decode number measured before this change is
+not comparable to one measured after it.
+
+**The noise floor.** Encode over three interleaved pairs spanned 892 to 1107 MB/s
+on identical code -- 24%. Nothing smaller than about 10% can be resolved by this
+harness on this machine, which is why the branchless loop above is recorded as
+"indistinguishable" rather than as a small win or a small loss.

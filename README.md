@@ -189,16 +189,25 @@ single-volume measurement.
 
 | path | encode | decode |
 |---|---|---|
-| CUDA, default | 1.77 GB/s | **2.39 GB/s** |
-| CUDA, `--effort high` | **1.70 GB/s** | **2.31 GB/s** |
-| CPU, default | **2.17 GB/s** | 1.99 GB/s |
-| CPU, `--effort high` | 1.63 GB/s | 1.92 GB/s |
+| CUDA, default | 2.06 GB/s | **3.21 GB/s** |
+| CUDA, `--effort high` | **2.13 GB/s** | **2.98 GB/s** |
+| CPU, default | **2.46 GB/s** | 2.03 GB/s |
+| CPU, `--effort high` | 1.61 GB/s | 1.91 GB/s |
 
-Measured on a 1 GiB volume at `--streams 16`, best of three, with driver startup
-excluded. GPU decode is ahead in every configuration; GPU encode is ahead at
-`--effort high` (where RDO costs the CPU more than the GPU) and behind by ~20% at
-default effort, because per-brick tables need a round trip to the host for
-clustering before the range-coding kernel can start.
+Decode is measured through `decode_into` on a reused buffer, not `decode` on a
+fresh `std::vector`. The difference is not small: `std::vector::resize`
+value-initializes, so a fresh 1 GiB output costs a full zero-fill plus page
+faults -- measured at more than every other stage of decode put together. That
+cost is real for a caller who needs a new buffer, but it is allocator behaviour
+rather than codec throughput, and the API offers `decode_into` for callers who
+can reuse one. Decode numbers taken before this distinction was drawn are not
+comparable to these.
+
+GPU decode is ahead in every configuration; GPU encode is ahead at `--effort
+high` (where RDO costs the CPU more than the GPU) and behind at default effort,
+because per-brick tables need a round trip to the host for clustering before the
+range-coding kernel can start -- that clustering is, by a wide margin, the
+largest single cost in GPU encode.
 
 The kernel row is measured with CUDA events and is stable. The host-delivered
 rows are wall-clock and vary by more than 2x run to run on this machine: writing

@@ -1,5 +1,6 @@
 // gpudct command-line interface.
 
+#include <algorithm>
 #include <chrono>
 #include <memory>
 #include <cstdio>
@@ -43,6 +44,7 @@ compression options:
   --qshape B       radial exponent of the quant matrix (default 2.0)
   --qamp A         radial amplitude of the quant matrix (default per profile)
   --deblock        apply the chunk-boundary deblocking filter on decode
+  --reps N         bench: repeat each point N times and keep the best
 
 structure:
   chunk 16^3 (transform unit), brick 128^3 (entropy and random-access unit)
@@ -55,6 +57,8 @@ struct Args {
   Dims dims{};
   DType dtype = DType::u8;
   bool have_dims = false, have_dtype = false, have_profile = false;
+  bool have_quality = false;
+  int reps = 1;
   EncodeOptions enc{};
   Backend backend = Backend::automatic;
   bool deblock = false;
@@ -92,6 +96,11 @@ bool parse(int argc, char** argv, Args& a) {
       const char* v = next("--quality");
       if (!v) return false;
       a.enc.quality = std::strtof(v, nullptr);
+      a.have_quality = true;
+    } else if (s == "--reps") {
+      const char* v = next("--reps");
+      if (!v) return false;
+      a.reps = std::atoi(v);
     } else if (s == "--effort") {
       const char* v = next("--effort");
       if (!v) return false;
@@ -303,21 +312,45 @@ int cmd_bench(const Args& a) {
   }
 
   std::printf("%-10s %10s %10s %12s %12s\n", "quality", "ratio", "bpv", "enc MB/s", "dec MB/s");
-  for (float q : {0.25f, 0.5f, 1.0f, 2.0f, 4.0f, 8.0f}) {
+  // An explicit --quality pins the sweep to that one point, which is what a
+  // throughput experiment wants; the six-point sweep is for rate-distortion.
+  const std::vector<float> qualities =
+      a.have_quality ? std::vector<float>{a.enc.quality}
+                     : std::vector<float>{0.25f, 0.5f, 1.0f, 2.0f, 4.0f, 8.0f};
+  const int reps = a.reps > 0 ? a.reps : 1;
+
+  for (float q : qualities) {
     EncodeOptions opts = a.enc;
     opts.quality = q;
-    std::vector<std::uint8_t> archive;
-    const auto t0 = std::chrono::steady_clock::now();
-    if (encode(raw.data(), a.dims, a.dtype, opts, archive, a.backend) != Status::ok) return 1;
-    const double te = seconds_since(t0);
+    opts.deadzone_override = a.deadzone;
+    opts.qshape_override = a.qshape;
+    opts.qamp_override = a.qamp;
 
-    DecodeOptions dopts;
-    dopts.threads = a.enc.threads;
-    std::vector<std::uint8_t> out;
-    VolumeInfo info;
-    const auto t1 = std::chrono::steady_clock::now();
-    if (decode(archive, dopts, out, info, a.backend) != Status::ok) return 1;
-    const double td = seconds_since(t1);
+    // Best of N, not mean: this machine's run-to-run spread is wide enough that
+    // a mean mostly measures thermal drift (docs/QUALITY.md).
+    std::vector<std::uint8_t> decoded(raw.size());
+    std::vector<std::uint8_t> archive;
+    double te = 1e30, td = 1e30;
+    for (int r = 0; r < reps; ++r) {
+      std::vector<std::uint8_t> a2;
+      const auto t0 = std::chrono::steady_clock::now();
+      if (encode(raw.data(), a.dims, a.dtype, opts, a2, a.backend) != Status::ok) return 1;
+      te = std::min(te, seconds_since(t0));
+      archive = std::move(a2);
+
+      // decode_into a buffer allocated once, not decode() into a fresh vector.
+      // std::vector value-initializes, so a fresh 1 GB output costs a full
+      // zero-fill plus page faults -- measured at more than every other stage of
+      // decode combined. That cost is real for a caller who needs a new buffer,
+      // but it is allocator behaviour rather than codec throughput, and the API
+      // already offers decode_into for callers who can reuse one.
+      DecodeOptions dopts;
+      dopts.threads = a.enc.threads;
+      VolumeInfo info;
+      const auto t1 = std::chrono::steady_clock::now();
+      if (decode_into(archive, dopts, decoded, info, a.backend) != Status::ok) return 1;
+      td = std::min(td, seconds_since(t1));
+    }
 
     std::printf("%-10.2f %10.2f %10.4f %12.1f %12.1f\n", static_cast<double>(q),
                 static_cast<double>(raw.size()) / static_cast<double>(archive.size()),

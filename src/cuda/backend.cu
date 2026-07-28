@@ -165,9 +165,18 @@ struct StageTimer {
   bool on = false;
   cudaEvent_t a{}, b{}, c{}, d{};
   float upload_ms = 0, k1_ms = 0, k2_ms = 0, download_ms = 0;
+  // Host-side wall clock and an explicit unaccounted remainder.
+  //
+  // The kernel timers alone covered 40% of decode and 32% of encode, and the
+  // silent remainder is where the real cost turned out to live -- it is what
+  // sent three previous optimizations at the wrong stage (see docs/QUALITY.md).
+  // A profile that cannot be checked against its own total is not a profile.
+  std::chrono::steady_clock::time_point t_start{};
+  double host_ms = 0;
 
   StageTimer() {
     on = std::getenv("GPUDCT_CUDA_PROFILE") != nullptr;
+    t_start = std::chrono::steady_clock::now();
     if (!on) return;
     cudaEventCreate(&a);
     cudaEventCreate(&b);
@@ -180,11 +189,31 @@ struct StageTimer {
     cudaEventDestroy(b);
     cudaEventDestroy(c);
     cudaEventDestroy(d);
+    const double total =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count() *
+        1000.0;
     std::fprintf(stderr,
                  "[cuda] k1 (entropy) %8.2f ms   k2 (transform) %8.2f ms   "
-                 "download %8.2f ms\n",
-                 k1_ms, k2_ms, download_ms);
+                 "download %8.2f ms\n"
+                 "[cuda] host prep %8.2f ms   total %8.2f ms   unaccounted %8.2f ms\n",
+                 k1_ms, k2_ms, download_ms, host_ms, total,
+                 total - k1_ms - k2_ms - download_ms - host_ms);
   }
+  // Wall-clock span for host work, which CUDA events cannot see.
+  struct HostSpan {
+    StageTimer& t;
+    std::chrono::steady_clock::time_point t0;
+    bool running = true;
+    explicit HostSpan(StageTimer& s) : t(s), t0(std::chrono::steady_clock::now()) {}
+    void stop() {
+      if (!running) return;
+      running = false;
+      if (t.on)
+        t.host_ms +=
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() * 1000.0;
+    }
+    ~HostSpan() { stop(); }
+  };
   void mark(cudaEvent_t e) {
     if (on) cudaEventRecord(e);
   }
@@ -384,6 +413,8 @@ Status decode_archive_attempt(std::span<const std::uint8_t> archive, const FileH
     const std::uint32_t n = static_cast<std::uint32_t>(
         std::min<std::uint64_t>(batch, h.brick_count - b0));
 
+    StageTimer::HostSpan prep(timer);
+
     tab_freq.clear();
     tab_base.assign(n, 0);
     tab_map.assign(static_cast<std::size_t>(n) * detail::ModelIndex::total,
@@ -455,6 +486,7 @@ Status decode_archive_attempt(std::span<const std::uint8_t> archive, const FileH
       return Status::io_error;
     }
 
+    prep.stop();
     timer.mark(timer.a);
     {
       const std::uint32_t total_threads = n * h.streams_per_brick;
@@ -853,6 +885,10 @@ Status encode_bricks_attempt(const void* data, Dims dims, DType dtype, float sca
     cudaEventSynchronize(t);
     float v = 0; cudaEventElapsedTime(&v, f, t); into += v;
   };
+  // Wall clock for the whole call, so the kernel timings can be checked against
+  // a total rather than believed. See the note on StageTimer.
+  const auto t_enc_start = std::chrono::steady_clock::now();
+  double ms_tables = 0, ms_payload = 0;
 
   for (std::uint64_t b0 = 0; b0 < brick_count; b0 += batch) {
     const std::uint32_t n =
@@ -998,9 +1034,9 @@ Status encode_bricks_attempt(const void* data, Dims dims, DType dtype, float sca
       dm.brick_base = d_bbase;
     }
     if (prof)
-      std::fprintf(stderr, "[cuda] per-brick tables %8.2f ms\n",
-                   std::chrono::duration<double>(std::chrono::steady_clock::now() - t_tab)
-                           .count() * 1000.0);
+      ms_tables +=
+          std::chrono::duration<double>(std::chrono::steady_clock::now() - t_tab).count() *
+          1000.0;
 
     {
       const std::uint32_t total_threads = n * P;
@@ -1055,6 +1091,7 @@ Status encode_bricks_attempt(const void* data, Dims dims, DType dtype, float sca
       return Status::io_error;
     }
 
+    const auto t_pay = std::chrono::steady_clock::now();
     // Assemble each brick payload in the container's layout. The kernel wrote
     // each stream's bytes at the *end* of its slab, so the live bytes start at
     // stream_cap - size.
@@ -1081,13 +1118,21 @@ Status encode_bricks_attempt(const void* data, Dims dims, DType dtype, float sca
                    packed.begin() + static_cast<std::ptrdiff_t>(offsets[idx] + sz));
       }
     }
+    if (prof)
+      ms_payload +=
+          std::chrono::duration<double>(std::chrono::steady_clock::now() - t_pay).count() *
+          1000.0;
   }
 
   if (prof) {
+    const double total =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t_enc_start).count() *
+        1000.0;
     std::fprintf(stderr,
                  "[cuda] ke1 (transform) %8.2f ms   ke2a (symbols) %8.2f ms   "
-                 "ke2b (rANS) %8.2f ms\n",
-                 ms_ke1, ms_ke2a, ms_ke2b);
+                 "ke2b (rANS) %8.2f ms\n"
+                 "[cuda] tables %8.2f ms   payload %8.2f ms   total %8.2f ms\n",
+                 ms_ke1, ms_ke2a, ms_ke2b, ms_tables, ms_payload, total);
     cudaEventDestroy(ea);
     cudaEventDestroy(eb);
     cudaEventDestroy(ec);

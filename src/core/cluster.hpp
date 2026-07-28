@@ -34,25 +34,57 @@ namespace gpudct::detail {
   return 8.0 * (2.0 + 3.0 * static_cast<double>(used));
 }
 
+// Exact log2 of a small integer, from a table.
+//
+// Clustering is the largest single cost in GPU encode -- 300 ms of a 385 ms
+// device-side gigabyte -- and essentially all of it is this logarithm: the
+// greedy merge evaluates one per used symbol, per candidate pair, per iteration,
+// which comes to a few hundred million calls per gigabyte.
+//
+// An *approximate* logarithm was tried here first and rejected: it cost 1.8% of
+// BD-rate, because merge decisions are sensitive enough that ~1e-4 of error
+// changes which contexts get clustered (docs/QUALITY.md). This is the way to get
+// the speed without the error. The arguments are always integer counts, so their
+// logarithms can simply be looked up -- the table holds the same double
+// std::log2 would return, not an approximation of it.
+inline constexpr std::size_t kLog2TableSize = 1u << 16;
+
+[[nodiscard]] inline const double* log2_table() {
+  static const std::vector<double> t = [] {
+    std::vector<double> v(kLog2TableSize);
+    for (std::size_t i = 1; i < kLog2TableSize; ++i) v[i] = std::log2(static_cast<double>(i));
+    return v;
+  }();
+  return t.data();
+}
+
+[[nodiscard]] inline double log2_int(std::uint64_t x) {
+  return x < kLog2TableSize ? log2_table()[x] : std::log2(static_cast<double>(x));
+}
+
 // Shannon cost of coding `counts` under the distribution of `model_counts`.
 [[nodiscard]] inline double cross_entropy_bits(const std::vector<std::uint64_t>& counts,
                                                const std::vector<std::uint64_t>& model_counts) {
   std::uint64_t total = 0;
   for (std::uint64_t c : model_counts) total += c;
   if (total == 0) return 0.0;
+  // -log2(c/total) == log2(total) - log2(c), so the numerator's logarithm is
+  // loop-invariant and the denominator's is a table lookup. That is the whole
+  // optimization: the same quantity, computed with two lookups instead of a
+  // division and a transcendental call.
+  const double log2_total = log2_int(total);
+  const double* tbl = log2_table();
   double bits = 0.0;
   for (std::size_t i = 0; i < counts.size(); ++i) {
     if (counts[i] == 0) continue;
     // A symbol the model never saw still has to be codeable; the normalizer
     // gives it one slot, so charge it accordingly rather than infinity.
-    const double p = model_counts[i] > 0
-                         ? static_cast<double>(model_counts[i]) / static_cast<double>(total)
-                         : 1.0 / static_cast<double>(kProbScale);
-    // std::log2, not an approximation. A fast bit-trick log2 was tried here and
-    // cost 1.8% BD-rate (-14.14% to -12.34%): the merge decisions are sensitive
-    // enough that a ~1e-4 error changes which contexts get clustered together.
-    // It saved about 50 ms per gigabyte, which is not worth 1.8% of the ratio.
-    bits += static_cast<double>(counts[i]) * -std::log2(p);
+    const std::uint64_t mc = model_counts[i];
+    const double cost = mc > 0 ? log2_total - (mc < kLog2TableSize ? tbl[mc]
+                                                                  : std::log2(
+                                                                        static_cast<double>(mc)))
+                               : std::log2(static_cast<double>(kProbScale));
+    bits += static_cast<double>(counts[i]) * cost;
   }
   return bits;
 }
@@ -103,8 +135,22 @@ struct ClusterResult {
     return r;
   }
 
+  // Entropy plus table cost of one cluster coded by its own distribution, in a
+  // single pass. cross_entropy_bits(c, c) + table_cost_bits(distinct(c)) is the
+  // same number, but walks the alphabet three times and recomputes the total.
   auto cost_of = [](const std::vector<std::uint64_t>& c) {
-    return cross_entropy_bits(c, c) + table_cost_bits(distinct(c));
+    std::uint64_t total = 0;
+    for (std::uint64_t v : c) total += v;
+    if (total == 0) return 0.0;
+    const double log2_total = log2_int(total);
+    double bits = 0.0;
+    std::size_t used = 0;
+    for (std::uint64_t v : c) {
+      if (v == 0) continue;
+      ++used;
+      bits += static_cast<double>(v) * (log2_total - log2_int(v));
+    }
+    return bits + table_cost_bits(used);
   };
 
   // Self-costs and the pairwise merge deltas are cached across iterations.
@@ -117,12 +163,30 @@ struct ClusterResult {
   std::vector<double> self(cl.size());
   for (std::size_t i = 0; i < cl.size(); ++i) self[i] = cost_of(cl[i]);
 
+  // Cost of merging two clusters, in one pass and with no allocation.
+  //
+  // The merged table's cross-entropy against each input sums to a single term:
+  // wherever the merged count is nonzero both inputs pay the same per-symbol
+  // cost, so their counts can be added before multiplying. The explicit form --
+  // build `merged`, call cross_entropy_bits twice, then distinct() -- walks the
+  // 256-symbol alphabet six times and allocates a vector per candidate pair,
+  // and there are O(n^2) pairs per model group per brick.
   auto merge_delta = [&](std::size_t i, std::size_t j) {
-    std::vector<std::uint64_t> merged(cl[i].size());
-    for (std::size_t k = 0; k < merged.size(); ++k) merged[k] = cl[i][k] + cl[j][k];
-    const double after = cross_entropy_bits(cl[i], merged) + cross_entropy_bits(cl[j], merged) +
-                         table_cost_bits(distinct(merged));
-    return after - (self[i] + self[j]);
+    const std::vector<std::uint64_t>& A = cl[i];
+    const std::vector<std::uint64_t>& B = cl[j];
+    std::uint64_t total = 0;
+    for (std::size_t k = 0; k < A.size(); ++k) total += A[k] + B[k];
+    if (total == 0) return -(self[i] + self[j]);
+    const double log2_total = log2_int(total);
+    double after = 0.0;
+    std::size_t used = 0;
+    for (std::size_t k = 0; k < A.size(); ++k) {
+      const std::uint64_t m = A[k] + B[k];
+      if (m == 0) continue;
+      ++used;
+      after += static_cast<double>(m) * (log2_total - log2_int(m));
+    }
+    return after + table_cost_bits(used) - (self[i] + self[j]);
   };
 
   const std::size_t n0 = cl.size();
