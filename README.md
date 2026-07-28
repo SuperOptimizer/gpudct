@@ -13,6 +13,12 @@ chunk =  16³ voxels   transform and quantization unit
 A 128³ brick is exactly one chunk of the Vesuvius open-data Zarr arrays, so an
 archive maps 1:1 onto the storage layout the data already uses.
 
+The brick is the independently decodable unit, but a single 16³ chunk can still
+be fetched for ~1/P of a brick decode -- `decode_chunk` walks only its own rANS
+stream's prefix and runs the inverse transform once. At the default 16 streams
+that is **16× cheaper than decoding the brick**, which is what a viewer caching
+at 16³ granularity pays on a miss. `gpudct randread <archive>` measures it.
+
 ## Build
 
 Needs CMake ≥ 3.28, Ninja, and a C++23-or-later compiler (developed against
@@ -112,11 +118,13 @@ for one-shot CLI use. All GPU numbers here exclude it and report it separately.
 
 **Stream count.** The bitstream's parse is data-dependent, so each rANS stream is
 decoded serially by one thread and total device parallelism is
-`bricks × streams_per_brick`. `--streams 16` is a large speedup over the default 4
-for ~0.1 % of ratio and is recommended for GPU-targeted archives. Beyond that it
-flattens: 32 streams adds ~3 % for 0.3 % of ratio, and 64 is worse than 32 on
-both counts. `docs/DESIGN.md` §3.4 explains the constraint and what a real fix
-would cost.
+`bricks × streams_per_brick`. `P` is also what sets the cost of a single-chunk
+random read, since that walks one stream's prefix — so GPU decode and random
+access want the same thing, and the default is 16 rather than 4 on that basis:
+−0.15 % ratio and −8 % CPU encode against +13 % GPU decode, a 1.45× cheaper chunk
+read, and CPU decode unchanged. Beyond 16 it flattens (32 adds ~3 % for 0.3 % of
+ratio; 64 is worse than 32 on both). `docs/DESIGN.md` §3.4 explains the parse
+constraint and what a real fix would cost.
 
 
 ## Measured against 3ddct

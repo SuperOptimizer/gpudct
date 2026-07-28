@@ -282,6 +282,76 @@ TEST(single_brick_decode_matches_full_decode) {
       }
 }
 
+// Sub-brick random access. A single-chunk fetch decodes only its stream's prefix
+// rather than the whole brick, so this is the test that the prefix walk leaves
+// the rANS state in exactly the place a full decode would have.
+//
+// Swept over streams_per_brick because P is what sets how the chunks are
+// distributed across streams: P=1 puts every chunk in one stream (the prefix is
+// the whole brick), P=16 spreads them, and a P that does not divide 512 evenly
+// is the case where an off-by-one in the walk would hide.
+TEST(single_chunk_decode_matches_full_decode) {
+  const Volume v = scroll_like_volume({200, 150, 140});
+  const std::vector<std::uint8_t> raw = to_typed(v, DType::u8);
+
+  for (std::uint8_t P : {std::uint8_t{1}, std::uint8_t{4}, std::uint8_t{7}, std::uint8_t{16}}) {
+    EncodeOptions opts;
+    opts.streams_per_brick = P;
+    std::vector<std::uint8_t> archive;
+    REQUIRE(encode(raw.data(), v.dims, DType::u8, opts, archive) == Status::ok);
+
+    std::vector<std::uint8_t> full;
+    VolumeInfo info;
+    REQUIRE(decode(archive, DecodeOptions{}, full, info) == Status::ok);
+
+    const Dims cgrid{(v.dims.x + kChunkDim - 1) / kChunkDim,
+                     (v.dims.y + kChunkDim - 1) / kChunkDim,
+                     (v.dims.z + kChunkDim - 1) / kChunkDim};
+    for (std::uint32_t cz = 0; cz < cgrid.z; ++cz)
+      for (std::uint32_t cy = 0; cy < cgrid.y; ++cy)
+        for (std::uint32_t cx = 0; cx < cgrid.x; ++cx) {
+          std::vector<std::uint8_t> chunk;
+          REQUIRE(decode_chunk(archive, cx, cy, cz, chunk) == Status::ok);
+          REQUIRE(chunk.size() == static_cast<std::size_t>(kChunkVox));
+          for (int z = 0; z < kChunkDim; ++z) {
+            const std::uint32_t gz = cz * kChunkDim + static_cast<std::uint32_t>(z);
+            if (gz >= v.dims.z) break;
+            for (int y = 0; y < kChunkDim; ++y) {
+              const std::uint32_t gy = cy * kChunkDim + static_cast<std::uint32_t>(y);
+              if (gy >= v.dims.y) break;
+              for (int x = 0; x < kChunkDim; ++x) {
+                const std::uint32_t gx = cx * kChunkDim + static_cast<std::uint32_t>(x);
+                if (gx >= v.dims.x) break;
+                const std::size_t li =
+                    (static_cast<std::size_t>(z) * kChunkDim + static_cast<std::size_t>(y)) *
+                        kChunkDim + static_cast<std::size_t>(x);
+                const std::size_t fi =
+                    (static_cast<std::size_t>(gz) * v.dims.y + gy) * v.dims.x + gx;
+                if (chunk[li] != full[fi]) {
+                  CHECK_EQ(static_cast<int>(chunk[li]), static_cast<int>(full[fi]));
+                  return;
+                }
+              }
+            }
+          }
+        }
+  }
+}
+
+// Out-of-range chunk coordinates must be rejected, not read out of bounds.
+TEST(single_chunk_decode_rejects_bad_coordinates) {
+  const Volume v = scroll_like_volume({64, 64, 64});
+  const std::vector<std::uint8_t> raw = to_typed(v, DType::u8);
+  std::vector<std::uint8_t> archive;
+  REQUIRE(encode(raw.data(), v.dims, DType::u8, EncodeOptions{}, archive) == Status::ok);
+
+  std::vector<std::uint8_t> chunk;
+  CHECK(decode_chunk(archive, 4, 0, 0, chunk) == Status::invalid_argument);
+  CHECK(decode_chunk(archive, 0, 4, 0, chunk) == Status::invalid_argument);
+  CHECK(decode_chunk(archive, 0, 0, 4, chunk) == Status::invalid_argument);
+  CHECK(decode_chunk(archive, 0, 0, 0, chunk) == Status::ok);
+}
+
 TEST(inspect_reports_what_was_encoded) {
   const Volume v = scroll_like_volume({50, 60, 70});
   const std::vector<std::uint8_t> raw = to_typed(v, DType::u16);

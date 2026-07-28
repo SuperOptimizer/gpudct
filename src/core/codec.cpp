@@ -619,6 +619,170 @@ struct DirectScatter {
 
 // Decodes one brick's payload. Writes into `out_work` (a kBrickDim^3 float
 // buffer) unless `direct` is set, in which case it scatters into the volume.
+// The fixed part of a coded brick payload: optional per-brick tables, the
+// per-stream byte counts, and where the stream data begins.
+//
+// Shared by the whole-brick decoder and the single-chunk one. They differ only
+// in how many streams they then walk and how far, so the parse -- which is also
+// all of the bitstream validation -- is written once.
+struct BrickHeaderView {
+  ModelSet brick_ms;                     // storage for per-brick tables, if present
+  bool has_brick_tables = false;
+  std::vector<std::uint32_t> sizes;      // coefficient stream sizes, P of them
+  std::vector<std::uint32_t> corr_sizes; // correction stream sizes, P of them if has_corr
+  bool has_corr = false;
+  std::size_t data_pos = 0;              // offset of the first coefficient stream
+
+  [[nodiscard]] const ModelSet* models(const ModelSet& global) const {
+    return has_brick_tables ? &brick_ms : &global;
+  }
+};
+
+[[nodiscard]] Status parse_brick_header(std::span<const std::uint8_t> payload,
+                                        const ModelSet& ms, std::uint32_t P,
+                                        BrickHeaderView& out) {
+  if (payload.size() < 3) return Status::truncated;
+  std::size_t pos = 1;  // payload[0] is the mode byte, already checked
+
+  const std::uint8_t table_flag = payload[pos++];
+  if (table_flag > 1) return Status::corrupt_bitstream;
+  if (table_flag == 1) {
+    if (pos + 4 > payload.size()) return Status::truncated;
+    const std::uint32_t blob_size = get_u32(payload, pos);
+    pos += 4;
+    if (blob_size > payload.size() - pos) return Status::corrupt_bitstream;
+    if (!read_brick_tables(payload.subspan(pos, blob_size), ms, out.brick_ms))
+      return Status::corrupt_bitstream;
+    pos += blob_size;
+    out.has_brick_tables = true;
+  }
+
+  if (payload.size() < pos + 4u * P + 1) return Status::truncated;
+  out.sizes.resize(P);
+  std::uint64_t sum = 0;
+  for (std::uint32_t s = 0; s < P; ++s) {
+    out.sizes[s] = get_u32(payload, pos);
+    pos += 4;
+    sum += out.sizes[s];
+  }
+
+  const std::uint8_t has_corr = payload[pos++];
+  if (has_corr > 1) return Status::corrupt_bitstream;
+  out.has_corr = has_corr != 0;
+  if (out.has_corr) {
+    if (pos + 4u * P > payload.size()) return Status::truncated;
+    out.corr_sizes.resize(P);
+    for (std::uint32_t s = 0; s < P; ++s) {
+      out.corr_sizes[s] = get_u32(payload, pos);
+      pos += 4;
+      sum += out.corr_sizes[s];
+    }
+  }
+  if (pos + sum != payload.size()) return Status::corrupt_bitstream;
+  out.data_pos = pos;
+  return Status::ok;
+}
+
+// Decode one 16^3 chunk out of a brick, without decoding the rest of it.
+//
+// Chunk `ci` is coded into stream `ci % P`, and each stream's chunks appear in
+// increasing index order, so reaching one chunk costs *one stream's prefix* --
+// about `ci / P` chunk decodes -- rather than the whole brick's 512. At the
+// recommended `--streams 16` that is roughly a sixteenth of the work, which is
+// what makes brick-granular random access usable for a viewer.
+//
+// The prefix still has to be entropy-decoded: rANS state carries from one chunk
+// to the next within a stream, and that is exactly the coupling that buys the
+// ratio. What the prefix does *not* pay for is the inverse transform, which runs
+// only for the target chunk.
+[[nodiscard]] Status decode_chunk_payload(std::span<const std::uint8_t> payload,
+                                          const QuantMatrix& qm, const ModelSet& ms,
+                                          std::uint32_t P, int target_ci, DType t, float scale,
+                                          float offset, Dims valid, TransformOps ops,
+                                          float* out_voxels,
+                                          std::vector<std::pair<std::uint32_t, std::int32_t>>*
+                                              out_corrections) {
+  if (payload.empty()) return Status::truncated;
+  if (target_ci < 0 || target_ci >= kChunksPerBrick) return Status::invalid_argument;
+  if (P == 0) return Status::corrupt_bitstream;
+
+  const int tcx = target_ci % kBrickChunks;
+  const int tcy = (target_ci / kBrickChunks) % kBrickChunks;
+  const int tcz = target_ci / (kBrickChunks * kBrickChunks);
+
+  if (payload[0] == kBrickRaw) {
+    // A raw brick has no entropy state at all, so the chunk is a strided copy.
+    if (valid.empty()) return Status::corrupt_bitstream;
+    if (payload.size() != 1 + valid.voxels() * dtype_size(t)) return Status::corrupt_bitstream;
+    const void* src = payload.data() + 1;
+    for (int z = 0; z < kChunkDim; ++z) {
+      const std::uint32_t sz = std::min<std::uint32_t>(
+          static_cast<std::uint32_t>(tcz * kChunkDim + z), valid.z - 1);
+      for (int y = 0; y < kChunkDim; ++y) {
+        const std::uint32_t sy = std::min<std::uint32_t>(
+            static_cast<std::uint32_t>(tcy * kChunkDim + y), valid.y - 1);
+        for (int x = 0; x < kChunkDim; ++x) {
+          const std::uint32_t sx = std::min<std::uint32_t>(
+              static_cast<std::uint32_t>(tcx * kChunkDim + x), valid.x - 1);
+          const std::size_t si = (static_cast<std::size_t>(sz) * valid.y + sy) * valid.x + sx;
+          out_voxels[(z * kChunkDim + y) * kChunkDim + x] =
+              load_voxel(src, t, si) * scale + offset;
+        }
+      }
+    }
+    return Status::ok;
+  }
+  if (payload[0] != kBrickCoded) return Status::corrupt_bitstream;
+
+  BrickHeaderView hv;
+  if (const Status hs = parse_brick_header(payload, ms, P, hv); hs != Status::ok) return hs;
+  const ModelSet* use = hv.models(ms);
+
+  const std::uint32_t s = static_cast<std::uint32_t>(target_ci) % P;
+  std::size_t pos = hv.data_pos;
+  for (std::uint32_t k = 0; k < s; ++k) pos += hv.sizes[k];
+  RansDecoder dec;
+  if (!dec.init(payload.subspan(pos, hv.sizes[s]), kRansStates)) return Status::corrupt_bitstream;
+
+  const bool want_corr = hv.has_corr && out_corrections != nullptr;
+  RansDecoder corr_dec;
+  if (want_corr) {
+    std::size_t cpos = hv.data_pos;
+    for (std::uint32_t k = 0; k < P; ++k) cpos += hv.sizes[k];
+    for (std::uint32_t k = 0; k < s; ++k) cpos += hv.corr_sizes[k];
+    if (!corr_dec.init(payload.subspan(cpos, hv.corr_sizes[s]), kRansStates))
+      return Status::corrupt_bitstream;
+  }
+
+  std::vector<float> coeffs(kChunkVox, 0.0f);
+  std::vector<std::int32_t> deltas(kChunkVox);
+  std::vector<int> touched;
+  touched.reserve(256);
+  const std::int32_t max_level = max_plausible_level(qm);
+
+  for (int ci = static_cast<int>(s); ci <= target_ci; ci += static_cast<int>(P)) {
+    std::uint8_t exponent = 0;
+    if (!decode_chunk_coeffs(dec, *use, coeffs.data(), qm.q.data(), exponent, max_level, touched))
+      return Status::corrupt_bitstream;
+    if (want_corr &&
+        !decode_correction_symbols(corr_dec, *use, deltas.data(), max_level))
+      return Status::corrupt_bitstream;
+
+    if (ci != target_ci) {
+      // Skip the transform: only the entropy state of the prefix matters.
+      for (int i : touched) coeffs[static_cast<std::size_t>(i)] = 0.0f;
+      continue;
+    }
+    ops.inv_hint(coeffs.data(), out_voxels, static_cast<int>(touched.size()));
+    for (int i : touched) coeffs[static_cast<std::size_t>(i)] = 0.0f;
+    if (want_corr)
+      for (int i = 0; i < kChunkVox; ++i)
+        if (deltas[i] != 0)
+          out_corrections->emplace_back(static_cast<std::uint32_t>(i), deltas[i]);
+  }
+  return Status::ok;
+}
+
 [[nodiscard]] Status decode_brick_payload(std::span<const std::uint8_t> payload,
                                           const QuantMatrix& qm, const ModelSet& ms,
                                           std::uint32_t P, DType t, float scale, float offset,
@@ -674,47 +838,11 @@ struct DirectScatter {
   }
   if (mode != kBrickCoded) return Status::corrupt_bitstream;
 
-  if (payload.size() < 3) return Status::truncated;
-  std::size_t pos = 1;
-
-  // Per-brick tables, if this brick chose to carry them.
-  ModelSet brick_ms;
-  const ModelSet* use = &ms;
-  const std::uint8_t table_flag = payload[pos++];
-  if (table_flag > 1) return Status::corrupt_bitstream;
-  if (table_flag == 1) {
-    if (pos + 4 > payload.size()) return Status::truncated;
-    const std::uint32_t blob_size = get_u32(payload, pos);
-    pos += 4;
-    if (blob_size > payload.size() - pos) return Status::corrupt_bitstream;
-    if (!read_brick_tables(payload.subspan(pos, blob_size), ms, brick_ms))
-      return Status::corrupt_bitstream;
-    pos += blob_size;
-    use = &brick_ms;
-  }
-
-  if (payload.size() < pos + 4u * P + 1) return Status::truncated;
-  std::vector<std::uint32_t> sizes(P);
-  std::uint64_t sum = 0;
-  for (std::uint32_t s = 0; s < P; ++s) {
-    sizes[s] = get_u32(payload, pos);
-    pos += 4;
-    sum += sizes[s];
-  }
-
-  const std::uint8_t has_corr = payload[pos++];
-  if (has_corr > 1) return Status::corrupt_bitstream;
-  std::vector<std::uint32_t> corr_sizes;
-  if (has_corr) {
-    if (pos + 4u * P > payload.size()) return Status::truncated;
-    corr_sizes.resize(P);
-    for (std::uint32_t s = 0; s < P; ++s) {
-      corr_sizes[s] = get_u32(payload, pos);
-      pos += 4;
-      sum += corr_sizes[s];
-    }
-  }
-  if (pos + sum != payload.size()) return Status::corrupt_bitstream;
+  BrickHeaderView hv;
+  if (const Status hs = parse_brick_header(payload, ms, P, hv); hs != Status::ok) return hs;
+  const ModelSet* use = hv.models(ms);
+  const std::vector<std::uint32_t>& sizes = hv.sizes;
+  std::size_t pos = hv.data_pos;
 
   // One decoder per stream; each walks its own chunks in increasing index order.
   std::vector<RansDecoder> decoders(P);
@@ -726,14 +854,14 @@ struct DirectScatter {
 
   // The correction streams are only parsed when the caller wants them. Skipping
   // them is exactly the "additive layer" property the format promises.
-  const bool want_corr = has_corr && out_corrections != nullptr;
+  const bool want_corr = hv.has_corr && out_corrections != nullptr;
   std::vector<RansDecoder> corr_decoders;
   if (want_corr) {
     corr_decoders.resize(P);
     for (std::uint32_t s = 0; s < P; ++s) {
-      if (!corr_decoders[s].init(payload.subspan(pos, corr_sizes[s]), kRansStates))
+      if (!corr_decoders[s].init(payload.subspan(pos, hv.corr_sizes[s]), kRansStates))
         return Status::corrupt_bitstream;
-      pos += corr_sizes[s];
+      pos += hv.corr_sizes[s];
     }
   }
 
@@ -1274,6 +1402,55 @@ Status decode_brick(std::span<const std::uint8_t> archive, std::uint32_t bx, std
   const float inv = 1.0f / h.data_scale;
   for (std::size_t k = 0; k < n; ++k)
     store_voxel(out.data(), h.dtype, k, (work[k] - h.data_offset) * inv);
+  return Status::ok;
+}
+
+Status decode_chunk(std::span<const std::uint8_t> archive, std::uint32_t cx, std::uint32_t cy,
+                    std::uint32_t cz, std::vector<std::uint8_t>& out, Backend backend) {
+  detail::FileHeader h;
+  const Status s = detail::read_header(archive, h);
+  if (s != Status::ok) return s;
+
+  const Dims cgrid{(h.dims.x + kChunkDim - 1) / kChunkDim,
+                   (h.dims.y + kChunkDim - 1) / kChunkDim,
+                   (h.dims.z + kChunkDim - 1) / kChunkDim};
+  if (cx >= cgrid.x || cy >= cgrid.y || cz >= cgrid.z) return Status::invalid_argument;
+
+  const std::uint32_t bx = cx / kBrickChunks, by = cy / kBrickChunks, bz = cz / kBrickChunks;
+  const Dims grid = brick_grid(h.dims);
+  const std::uint64_t bi = (static_cast<std::uint64_t>(bz) * grid.y + by) * grid.x + bx;
+  const int ci = static_cast<int>(((cz % kBrickChunks) * kBrickChunks + (cy % kBrickChunks)) *
+                                      kBrickChunks +
+                                  (cx % kBrickChunks));
+
+  const std::size_t e = static_cast<std::size_t>(h.index_offset + bi * detail::BrickEntry::kSize);
+  if (e + detail::BrickEntry::kSize > archive.size()) return Status::corrupt_bitstream;
+  const std::uint64_t off = detail::get_u64(archive, e);
+  const std::uint32_t size = detail::get_u32(archive, e + 8);
+  if (off > archive.size() || size > archive.size() - off) return Status::corrupt_bitstream;
+
+  const detail::QuantMatrix qm =
+      detail::QuantMatrix::build({h.q_base, h.q_a, h.q_b, h.deadzone});
+  const detail::ModelSet ms = detail::ModelSet::defaults(h.table_version);
+
+  std::vector<float> voxels(kChunkVox);
+  std::vector<std::pair<std::uint32_t, std::int32_t>> corrections;
+  const Status ds = decode_chunk_payload(
+      archive.subspan(static_cast<std::size_t>(off), size), qm, ms, h.streams_per_brick, ci,
+      h.dtype, h.data_scale, h.data_offset, brick_valid_extent(h.dims, bx, by, bz),
+      ops_for(backend), voxels.data(), &corrections);
+  if (ds != Status::ok) return ds;
+
+  out.assign(static_cast<std::size_t>(kChunkVox) * dtype_size(h.dtype), 0);
+  const float inv = 1.0f / h.data_scale;
+  for (std::size_t k = 0; k < kChunkVox; ++k)
+    store_voxel(out.data(), h.dtype, k, (voxels[k] - h.data_offset) * inv);
+  // Corrections are applied to the stored value, exactly as decode_into does --
+  // the declared bound was measured against what store_voxel writes.
+  for (const auto& [i, delta] : corrections)
+    store_voxel(out.data(), h.dtype, i,
+                load_voxel(out.data(), h.dtype, i) +
+                    static_cast<float>(delta) * h.corr_step);
   return Status::ok;
 }
 

@@ -29,6 +29,7 @@ usage:
   gpudct eval       <in.raw> --dims X,Y,Z --dtype T [options]
   gpudct metrics    <a.raw> <b.raw> --dims X,Y,Z --dtype T
   gpudct bits       <in.raw> --dims X,Y,Z --dtype T [options]
+  gpudct randread   <in.gdct>                    (random-access cost)
 
 dtypes:
   u8 s8 u16 s16 u32 s32 f32          (no 64-bit types; see docs/DESIGN.md R7)
@@ -37,7 +38,7 @@ compression options:
   --profile P      archival | balanced | viewing      (default balanced)
   --quality Q      higher is finer; scales the quantizer (default 1.0)
   --effort E       fast | normal | high               (default normal)
-  --streams N      rANS streams per brick, 1..64      (default 4)
+  --streams N      rANS streams per brick, 1..64      (default 16)
   --threads N      0 = hardware concurrency           (default 0)
   --backend B      auto | cpu-scalar | cpu-simd | cuda
   --deadzone D     dead-zone width as a fraction of a step (default 0.34)
@@ -511,6 +512,62 @@ int cmd_bits(const Args& a) {
   return 0;
 }
 
+// What a random read actually costs, per chunk and per brick.
+//
+// The question a viewer cares about is not throughput but the cost of a cache
+// miss. Both units are measured over the same random positions so the comparison
+// is not confounded by which part of the volume gets touched.
+int cmd_randread(const Args& a) {
+  if (a.in.empty()) return usage();
+  std::vector<std::uint8_t> archive;
+  std::string err;
+  if (!read_file(a.in, archive, err)) {
+    std::fprintf(stderr, "error: %s\n", err.c_str());
+    return 1;
+  }
+  VolumeInfo info;
+  if (inspect(archive, info) != Status::ok) {
+    std::fprintf(stderr, "error: not a gpudct archive\n");
+    return 1;
+  }
+
+  const Dims bg = brick_grid(info.dims);
+  const Dims cg{(info.dims.x + kChunkDim - 1) / kChunkDim,
+                (info.dims.y + kChunkDim - 1) / kChunkDim,
+                (info.dims.z + kChunkDim - 1) / kChunkDim};
+  const int n = 200;
+  // A fixed LCG, not a random device: the two loops must visit the same places,
+  // and a rerun must be comparable to the last one.
+  std::uint32_t seed = 12345;
+  auto next = [&seed] { seed = seed * 1664525u + 1013904223u; return seed >> 8; };
+
+  std::vector<std::uint32_t> pos(static_cast<std::size_t>(n) * 3);
+  for (int i = 0; i < n * 3; ++i) pos[static_cast<std::size_t>(i)] = next();
+
+  std::vector<std::uint8_t> buf;
+  const auto t0 = std::chrono::steady_clock::now();
+  for (int i = 0; i < n; ++i)
+    if (decode_chunk(archive, pos[i * 3 + 0] % cg.x, pos[i * 3 + 1] % cg.y,
+                     pos[i * 3 + 2] % cg.z, buf, a.backend) != Status::ok)
+      return 1;
+  const double tc = seconds_since(t0);
+
+  const auto t1 = std::chrono::steady_clock::now();
+  for (int i = 0; i < n; ++i)
+    if (decode_brick(archive, (pos[i * 3 + 0] % cg.x) / kBrickChunks,
+                     (pos[i * 3 + 1] % cg.y) / kBrickChunks,
+                     (pos[i * 3 + 2] % cg.z) / kBrickChunks, buf, a.backend) != Status::ok)
+      return 1;
+  const double tb = seconds_since(t1);
+
+  std::printf("%ux%ux%u  %u streams/brick  %u bricks, %u chunks\n", info.dims.x, info.dims.y,
+              info.dims.z, info.streams_per_brick, bg.x * bg.y * bg.z, cg.x * cg.y * cg.z);
+  std::printf("%-22s %10.3f ms/read\n", "decode_chunk (16^3)", tc / n * 1000.0);
+  std::printf("%-22s %10.3f ms/read\n", "decode_brick (128^3)", tb / n * 1000.0);
+  std::printf("%-22s %10.2fx cheaper\n", "chunk vs brick", tb / tc);
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -523,6 +580,7 @@ int main(int argc, char** argv) {
   if (a.cmd == "eval") return cmd_eval(a);
   if (a.cmd == "metrics") return cmd_metrics(a);
   if (a.cmd == "bits") return cmd_bits(a);
+  if (a.cmd == "randread") return cmd_randread(a);
   if (a.cmd == "-h" || a.cmd == "--help" || a.cmd == "help") {
     usage();
     return 0;

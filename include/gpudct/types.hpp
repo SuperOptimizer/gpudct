@@ -197,7 +197,19 @@ struct EncodeOptions {
   // to a handful (docs/DESIGN.md section 3.4). Costs a second symbol pass at
   // encode; a brick that cannot pay for its tables keeps the global ones.
   bool per_brick_tables = true;
-  std::uint8_t streams_per_brick = 4;  // P in docs/DESIGN.md section 2
+  // P in docs/DESIGN.md section 2. Sets three things at once, which is why the
+  // default is not the smallest value that works:
+  //
+  //   - GPU decode parallelism, which is bricks x P (+13% from 4 to 16).
+  //   - The cost of a single-chunk random read, which walks one stream's prefix,
+  //     so it falls roughly as 1/P (1.87 ms -> 1.29 ms per chunk from 4 to 16).
+  //   - Ratio, which it costs: one rANS flush per stream per brick.
+  //
+  // Measured 4 -> 16 on a 512^3 scroll volume: -0.15% ratio and -8% CPU encode,
+  // against +13% GPU decode and 1.45x cheaper random chunk access, with CPU
+  // decode unchanged. A volume is encoded once and read many times, so 16 is the
+  // better default; drop to 4 if archive size is the only thing that matters.
+  std::uint8_t streams_per_brick = 16;
   int threads = 0;                     // 0 = hardware concurrency
 };
 

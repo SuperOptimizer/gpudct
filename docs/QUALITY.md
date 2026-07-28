@@ -567,3 +567,51 @@ not comparable to one measured after it.
 on identical code -- 24%. Nothing smaller than about 10% can be resolved by this
 harness on this machine, which is why the branchless loop above is recorded as
 "indistinguishable" rather than as a small win or a small loss.
+
+### Sub-brick random access, and what `streams_per_brick` really controls
+
+The brick is the independently decodable unit, so "the chunk is never addressable
+on its own" was the standing description. That was true of the API and false of
+the format. Chunk `ci` is coded into stream `ci % P`, and each stream's chunks
+appear in increasing index order, so reaching one chunk needs **one stream's
+prefix** -- about `ci / P` chunk decodes -- not all 512. The prefix must be
+entropy-decoded, because rANS state carries from chunk to chunk within a stream
+and that coupling is what buys the ratio; but it does not need the inverse
+transform, which runs once for the target chunk only.
+
+`decode_chunk` does this. Measured on a 512^3 scroll volume, 200 random reads:
+
+| P | ratio | `decode_chunk` | `decode_brick` | cheaper by |
+|---|---|---|---|---|
+| 1 | 13.25x | 3.97 ms | 20.7 ms | 5.2x |
+| 4 | 13.25x | 1.87 ms | 20.8 ms | 11.1x |
+| 8 | 13.24x | 1.62 ms | 20.8 ms | 12.8x |
+| 16 | 13.23x | 1.29 ms | 20.8 ms | **16.2x** |
+| 32 | 13.21x | 1.20 ms | 20.7 ms | 17.3x |
+
+Even at `P=1`, where the prefix is the whole brick up to the target, it is 5.2x
+cheaper -- because skipping 511 inverse transforms is most of the saving. The
+transform is a larger share of brick decode than the entropy stage is.
+
+This reframes `P`. It had been treated as a GPU-parallelism knob costing ratio;
+it is simultaneously the random-access granularity knob, and the two want the
+same thing. The default moves from 4 to 16 on this evidence, measured on the same
+volume:
+
+| | 4 -> 16 |
+|---|---|
+| ratio | **-0.15%** |
+| GPU decode | **+13%** |
+| random chunk read | **1.45x cheaper** |
+| CPU decode | unchanged |
+| CPU encode | **-8%** |
+
+A volume is encoded once and read many times, so trading 8% of encode for 13% of
+GPU decode and a much cheaper cache miss is the right side of that deal. Drop
+back to 4 when archive size is the only thing that matters -- it is still only
+0.15%.
+
+The comparison that prompted this: fenix decodes a 64^3 brick and caches 16^3
+chunks, so a cache miss costs a 256 KiB decode. A 128^3 brick makes that 2 MiB,
+8x worse -- which was a real deficiency until the prefix walk existed. With it, a
+miss costs 1.29 ms against fenix's brick decode rather than 20.8 ms.

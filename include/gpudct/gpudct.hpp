@@ -58,15 +58,35 @@ struct VolumeInfo {
                                  VolumeInfo& info, Backend backend = Backend::automatic);
 
 // --------------------------------------------------------------------------
-// Random access. Decodes a single 128^3 brick, which is the archive's
-// independently decodable unit -- see docs/DESIGN.md section 2 for why the
-// granularity is the brick and not the 16^3 chunk.
+// Random access. The brick is the archive's independently decodable unit -- see
+// docs/DESIGN.md section 2 for why the entropy unit is not the 16^3 chunk.
 //
 // `out` receives kBrickDim^3 elements of the archive's dtype. Voxels beyond the
 // volume boundary are edge-replicated padding and should be discarded.
 // --------------------------------------------------------------------------
 [[nodiscard]] Status decode_brick(std::span<const std::uint8_t> archive,
                                   std::uint32_t bx, std::uint32_t by, std::uint32_t bz,
+                                  std::vector<std::uint8_t>& out,
+                                  Backend backend = Backend::automatic);
+
+// --------------------------------------------------------------------------
+// Sub-brick random access: one 16^3 chunk, at chunk coordinates (ceil(dims/16)
+// grid). `out` receives kChunkVox elements of the archive's dtype.
+//
+// Cheaper than decode_brick without being independent of it. Chunk `ci` within a
+// brick is coded into stream `ci % streams_per_brick`, and a stream's chunks
+// appear in increasing index order, so this decodes one stream's prefix -- about
+// `ci / P` chunks -- instead of all 512. The inverse transform runs once, for the
+// requested chunk only.
+//
+// The saving therefore scales with `streams_per_brick`, which makes that setting
+// a random-access knob as well as a GPU-parallelism one: at the recommended 16 it
+// is roughly a sixteenth of a brick decode, at the default 4 roughly a quarter.
+// For a viewer that caches at 16^3 granularity, this is what a cache miss costs
+// instead of a whole 2 MiB brick.
+// --------------------------------------------------------------------------
+[[nodiscard]] Status decode_chunk(std::span<const std::uint8_t> archive,
+                                  std::uint32_t cx, std::uint32_t cy, std::uint32_t cz,
                                   std::vector<std::uint8_t>& out,
                                   Backend backend = Backend::automatic);
 
