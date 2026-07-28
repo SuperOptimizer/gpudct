@@ -198,7 +198,6 @@ struct EncodeOptions {
   // encode; a brick that cannot pay for its tables keeps the global ones.
   bool per_brick_tables = true;
   std::uint8_t streams_per_brick = 4;  // P in docs/DESIGN.md section 2
-  bool progressive = false;            // PROFILE_PROGRESSIVE band ordering
   int threads = 0;                     // 0 = hardware concurrency
 };
 

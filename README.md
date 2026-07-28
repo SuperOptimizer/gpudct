@@ -78,8 +78,9 @@ archives; under RDO they produce archives of identical size that decode to the
 same voxels, and the difference is worth understanding -- see below.
 
 Not done: DC-plane prediction (measured worthless -- DC is 0.1-0.5% of coded
-bits), the progressive profile, Zarr integration, and comparisons against
-ZFP / SZ3.
+bits), Zarr integration, comparisons against ZFP / SZ3, and CI. A progressive
+band-ordered profile was specified but never built; the option that advertised it
+has been removed rather than left claiming something untrue (DESIGN.md 3.7).
 
 Measured on a real full-resolution 128³ brick from `PHerc0332`, balanced profile
 (one brick = one Zarr chunk of the open dataset):
@@ -98,25 +99,24 @@ quality 0.5 gets 19.5× on a full-resolution brick and 5.7× on a level-3
 redundancy the transform feeds on. Benchmark on the resolution you intend to
 store.
 
-Throughput on a 512³ volume (quality 0.5, 16-core CPU / RTX 5080):
+Throughput is measured on a 1 GiB volume and reported below under "GPU
+backend" — a 512³ volume is only 64 bricks, which is too few to occupy the
+device and says more about launch overhead than about the codec.
 
-| path | encode | decode |
-|---|---|---|
-| CPU, all threads | 2639 MB/s | 1000–1258 MB/s |
-| CUDA (`--streams 32`), warm | — | 560–709 MB/s |
-| CUDA, first call in a process | — | ~49 MB/s |
+Two things that are structural rather than tuning:
 
-The cold-start row is not a rounding detail: creating a CUDA context and JITting
-the kernels costs one to two seconds, which swamps a single decode entirely. The
-GPU path is worth using from a long-running process that decodes many volumes,
-and is a pessimization for one-shot CLI use.
+**Cold start.** Creating a CUDA context and loading the kernels costs one to two
+seconds, once per process. That swamps a single decode entirely, so the GPU path
+is for a long-running process that decodes many volumes and is a pessimization
+for one-shot CLI use. All GPU numbers here exclude it and report it separately.
 
-The GPU does not beat the CPU here, and the cause is structural: the bitstream's
-parse is data-dependent, so each rANS stream must be decoded serially by one
-thread, and total device parallelism is `bricks × streams_per_brick`. Use
-`--streams 16` or higher for GPU-targeted archives — it is a 5× GPU speedup for
-1.3 % of ratio. `docs/DESIGN.md` §3.4 explains the constraint and what a real
-fix would cost.
+**Stream count.** The bitstream's parse is data-dependent, so each rANS stream is
+decoded serially by one thread and total device parallelism is
+`bricks × streams_per_brick`. `--streams 16` is a large speedup over the default 4
+for ~0.1 % of ratio and is recommended for GPU-targeted archives. Beyond that it
+flattens: 32 streams adds ~3 % for 0.3 % of ratio, and 64 is worse than 32 on
+both counts. `docs/DESIGN.md` §3.4 explains the constraint and what a real fix
+would cost.
 
 
 ## Measured against 3ddct

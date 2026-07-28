@@ -34,7 +34,7 @@ than pending -- DC carries 0.1-0.5% of coded bits, so there is nothing there to
 predict. The quantizer matrix has been swept and is a PSNR/SSIM frontier rather
 than a missed win (docs/QUALITY.md).
 
-Not yet done: progressive profile, Zarr integration, baselines against ZFP/SZ3,
+Not yet done: Zarr integration, baselines against ZFP/SZ3, CI of any kind,
 and CUDA stream overlap -- every device transfer is still a synchronous
 `cudaMemcpy` on the default stream, so no batch's host preparation overlaps any
 other batch's kernels. 3ddct is measured at -16.97% BD-rate at `--effort high`
@@ -130,7 +130,8 @@ CPU throughput, and profiling confirms the memory-bound regime the design predic
 
 ### M8 — Integration and tuning
 Zarr v3 codec plugin (one Zarr chunk = one brick), a C ABI + Python binding, a Fenix-side
-reader, the `PROFILE_PROGRESSIVE` band-ordered profile and LOD decode path. Then the
+reader, and -- if wanted -- a band-ordered profile with an LOD decode path (see
+DESIGN.md 3.7, removed rather than left half-built). Then the
 optimization backlog: K1/K2 fusion if profiling justifies it, the tensor-core transform
 experiment, occupancy and shared-memory tuning, `P` auto-selection.
 

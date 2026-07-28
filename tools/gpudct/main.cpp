@@ -287,7 +287,6 @@ int cmd_inspect(const Args& a) {
   std::printf("%-18s %llu (128^3 each)\n", "bricks",
               static_cast<unsigned long long>(info.brick_count));
   std::printf("%-18s %u\n", "streams per brick", info.streams_per_brick);
-  std::printf("%-18s %s\n", "progressive", info.progressive ? "yes" : "no");
   std::printf("%-18s base=%.3f a=%.3f b=%.3f deadzone=%.3f\n", "quantizer", info.quant.base,
               info.quant.a, info.quant.b, info.quant.deadzone);
   std::printf("%-18s %.2fx (%.3f bits/voxel)\n", "ratio",

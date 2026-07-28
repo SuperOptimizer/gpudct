@@ -21,7 +21,6 @@ struct VolumeInfo {
   std::uint32_t version = 0;
   std::uint64_t brick_count = 0;
   std::uint8_t streams_per_brick = 0;
-  bool progressive = false;
   QuantParams quant{};
 };
 

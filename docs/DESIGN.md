@@ -310,17 +310,25 @@ as residuals against it:
 The DC plane is itself a volume, so it is stored as a nested gpudct archive. Recursion
 bottoms out when a level fits in one brick.
 
-### 3.7 Frequency-band progressive profile (optional)
+### 3.7 Frequency-band progressive profile (removed)
 
-Because the DCT's low-frequency corner *is* a downsampled signal, decoding only the
-`2³ / 4³ / 8³` low-frequency corner of each chunk yields an exact 8× / 4× / 2×
-downsampled volume. If the bitstream is ordered band-major with per-band byte offsets in
-the brick header, a viewer gets progressive refinement and cheap LODs for free.
+This was specified and never implemented, and the half-built state was worse than
+either alternative: `EncodeOptions::progressive` set a header flag that nothing
+acted on, and `inspect` reported it back, so an archive could claim a property it
+did not have. A container that can lie about its own contents is a defect, not a
+missing feature. Both the flag and the option are gone; header flag bit 1 is left
+permanently unused rather than reassigned, so no archive written earlier can be
+misread by a later decoder.
 
-Cost: `bands × P` rANS flushes instead of `P` (≈ 2 % at 4 bands, `P=4`). Hence it's a
-**profile flag**, not the default:
-- `PROFILE_DENSE` (default) — max ratio, single band ordering.
-- `PROFILE_PROGRESSIVE` — band-ordered, ~2 % larger, LOD/streaming friendly.
+The underlying idea remains sound and is recorded here in case it is wanted: the
+DCT's low-frequency corner *is* a downsampled signal, so decoding only the
+`2³ / 4³ / 8³` corner of each chunk yields an exact 8× / 4× / 2× downsampled
+volume. Ordering the bitstream band-major with per-band offsets in the brick
+header would give a viewer progressive refinement and cheap LODs, at a cost of
+`bands × P` rANS flushes instead of `P` (≈ 2 % at 4 bands, `P=4`) -- which is why
+it would have to be optional. Implementing it means doing the band ordering, the
+per-band offsets, and an LOD decode path together, and re-introducing a flag only
+once all three exist.
 
 ### 3.8 Deblocking
 

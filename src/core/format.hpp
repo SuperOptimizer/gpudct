@@ -24,7 +24,8 @@ inline constexpr char kMagic[8] = {'G', 'P', 'U', 'D', 'C', 'T', '\0', '\0'};
 inline constexpr std::uint32_t kFormatVersion = 1;
 
 inline constexpr std::uint32_t kFlagCustomTables = 1u << 0;
-inline constexpr std::uint32_t kFlagProgressive = 1u << 1;
+// Bit 1 was a progressive-band-ordering flag that nothing ever acted on; it is
+// left unused rather than reassigned, so no old archive can be misread.
 inline constexpr std::uint32_t kFlagRelativeScaling = 1u << 2;
 // A bounded-error correction layer is present (docs/DESIGN.md section 3.5).
 inline constexpr std::uint32_t kFlagCorrections = 1u << 3;

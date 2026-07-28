@@ -927,7 +927,6 @@ Status inspect(std::span<const std::uint8_t> archive, VolumeInfo& out) {
   out.version = h.version;
   out.brick_count = h.brick_count;
   out.streams_per_brick = h.streams_per_brick;
-  out.progressive = (h.flags & detail::kFlagProgressive) != 0;
   out.quant = {h.q_base, h.q_a, h.q_b, h.deadzone};
   return Status::ok;
 }
@@ -949,7 +948,6 @@ Status encode(const void* data, Dims dims, DType dtype, const EncodeOptions& opt
   h.profile = opts.profile;
   h.streams_per_brick = static_cast<std::uint8_t>(P);
   h.brick_count = geo.brick_count();
-  if (opts.progressive) h.flags |= detail::kFlagProgressive;
 
   QuantParams qp = QuantParams::for_profile(opts.profile, opts.quality);
   qp.deadzone = deadzone_for_effort(opts.effort);
