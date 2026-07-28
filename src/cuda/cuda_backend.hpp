@@ -5,12 +5,14 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <vector>
 
 #include "core/format.hpp"
 #include "core/models.hpp"
 #include "core/quant.hpp"
+#include "gpudct/gpudct.hpp"
 #include "gpudct/types.hpp"
 
 namespace gpudct::cuda {
@@ -22,6 +24,29 @@ namespace gpudct::cuda {
 // Returns Status::backend_unavailable when the archive uses something this path
 // does not implement (raw-mode bricks, the correction layer), so the caller can
 // fall back to the CPU rather than receive a wrong answer.
+// Persistent device-resident decoder; see include/gpudct/device_volume.hpp.
+// The struct is opaque to everything outside backend.cu.
+struct DeviceVolumeImpl;
+
+// Everything the public shell needs to answer queries without seeing the
+// implementation type, copied out at open time.
+struct DeviceVolumeInfo {
+  VolumeInfo info{};
+  Dims grid{};
+  std::uint64_t bricks = 0;
+  std::uint32_t batch = 0;
+  std::size_t device_bytes = 0;
+};
+
+[[nodiscard]] Status device_volume_open(std::span<const std::uint8_t> archive,
+                                        DeviceVolumeImpl** out, DeviceVolumeInfo& summary);
+void device_volume_close(DeviceVolumeImpl* v);
+[[nodiscard]] Status device_malloc(std::size_t bytes, void** out);
+void device_free(void* p);
+[[nodiscard]] Status device_to_host(void* dst, const void* src, std::size_t bytes);
+[[nodiscard]] Status device_volume_decode(DeviceVolumeImpl* v,
+                                          std::span<const std::uint32_t> indices, void* d_out);
+
 [[nodiscard]] Status decode_archive(std::span<const std::uint8_t> archive,
                                     const detail::FileHeader& h, const detail::QuantMatrix& qm,
                                     const detail::ModelSet& ms, std::span<std::uint8_t> out);

@@ -682,3 +682,46 @@ and did not reproduce -- three clean reps gave 6.0 ms. It was taken immediately
 after generating the test volume with a slow script, so the machine was still
 busy. A number that disagrees with its neighbours by 10x is a bad measurement
 until proven otherwise; it should not be reasoned about.
+
+### DeviceVolume: the archive stays in VRAM
+
+The ordinary decode entry points are the wrong shape for a viewer that keeps a
+scroll compressed in device memory. Every call uploads the archive, allocates
+scratch, expands entropy tables, parses every brick header on the host, and
+copies the result back to system memory -- and for a batch of eight bricks that
+fixed cost *is* the time, while the copy back is pure waste when the consumer is
+a renderer on the same device.
+
+`DeviceVolume` pays it once at open. Measured on a 512^3 volume at P=64, 20
+iterations after a warm-up, decoding into device memory with no readback:
+
+| batch | latency | rate |
+|---|---|---|
+| 1 brick (2 MiB) | 5.52 ms | 381 MB/s |
+| 8 bricks (16 MiB) | 5.74 ms | 2.93 GB/s |
+| 32 bricks (64 MiB) | 6.45 ms | **10.4 GB/s** |
+
+The shape is the whole story: latency is nearly flat in batch size, because it is
+the K1 serial chain (`512/P` chunks per thread) and almost nothing else. A caller
+should therefore batch as much as it can -- one brick and thirty-two cost the
+same 6 ms.
+
+Against where this started, for the eight-brick case a viewer actually issues:
+
+| | 8 bricks |
+|---|---|
+| session start (P=16, flat K1, decode to host) | 44 ms |
+| + P=64 and shared-memory slot tables | 17.9 ms |
+| + DeviceVolume (resident archive, no readback) | **5.7 ms** |
+
+**A scratch bug worth recording.** The first version sized the sparse coefficient
+buffers for the format's worst case, 4096 nonzeros per chunk. That is 8.4 MB of
+device memory per brick of batch, and the reported footprint came out at 526 MiB
+for a volume whose *compressed* form is 10 MiB. On a class whose entire purpose
+is to make VRAM go further, the scratch dwarfing the archive is not a tuning
+detail, it is the feature failing. Sizing for typical occupancy and growing once
+on overflow -- which the buffers being persistent makes cheap -- brought it to
+62.5 MiB with no change in latency.
+
+That number is the one to quote: a 100 GB scroll at 13x holds ~7.7 GB of
+compressed archive in VRAM plus ~50 MiB of decode scratch.

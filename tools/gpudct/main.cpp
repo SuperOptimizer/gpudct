@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 
+#include "gpudct/device_volume.hpp"
 #include "gpudct/gpudct.hpp"
 #include "gpudct/metrics.hpp"
 #include "core/train.hpp"
@@ -565,6 +566,41 @@ int cmd_randread(const Args& a) {
   std::printf("%-22s %10.3f ms/read\n", "decode_chunk (16^3)", tc / n * 1000.0);
   std::printf("%-22s %10.3f ms/read\n", "decode_brick (128^3)", tb / n * 1000.0);
   std::printf("%-22s %10.2fx cheaper\n", "chunk vs brick", tb / tc);
+
+  // The VRAM-residency path: archive resident on the device, decode straight
+  // into device memory, nothing copied back. This is the number a viewer that
+  // keeps the volume compressed in VRAM actually lives with.
+  std::unique_ptr<DeviceVolume> dv;
+  if (DeviceVolume::open(archive, dv) == Status::ok) {
+    const std::size_t brick_vox = static_cast<std::size_t>(kBrickDim) * kBrickDim * kBrickDim;
+    const std::size_t esz = dtype_size(info.dtype);
+    for (std::uint32_t batch : {1u, 8u, 32u}) {
+      if (batch > dv->brick_count() || batch > dv->max_batch()) continue;
+      void* d_out = nullptr;
+      if (DeviceVolume::device_malloc(batch * brick_vox * esz, &d_out) != Status::ok) break;
+      std::vector<std::uint32_t> want(batch);
+      for (std::uint32_t i = 0; i < batch; ++i)
+        want[i] = static_cast<std::uint32_t>(next() % dv->brick_count());
+      // One warm-up: the first call still faults in lazily-created device state,
+      // and reporting that as steady state would measure the driver.
+      (void)dv->decode_bricks(want, d_out);
+
+      const int iters = 20;
+      const auto t2 = std::chrono::steady_clock::now();
+      for (int i = 0; i < iters; ++i) {
+        for (std::uint32_t k = 0; k < batch; ++k)
+          want[k] = static_cast<std::uint32_t>(next() % dv->brick_count());
+        if (dv->decode_bricks(want, d_out) != Status::ok) break;
+      }
+      const double dt = seconds_since(t2) / iters;
+      DeviceVolume::device_free(d_out);
+      std::printf("DeviceVolume %2u brick%s  %10.3f ms  %9.1f MB/s (device-resident)\n", batch,
+                  batch == 1 ? " " : "s", dt * 1000.0,
+                  static_cast<double>(batch * brick_vox * esz) / dt / 1e6);
+    }
+    std::printf("%-22s %10.1f MiB compressed in VRAM\n", "device footprint",
+                static_cast<double>(dv->device_bytes()) / 1048576.0);
+  }
   return 0;
 }
 

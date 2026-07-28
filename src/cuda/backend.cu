@@ -32,6 +32,8 @@
 #include "core/brick_tables.hpp"
 #include "core/rdo.hpp"
 #include "gpudct/gpudct.hpp"
+#include "gpudct/device_volume.hpp"
+#include "cuda/cuda_backend.hpp"
 
 namespace gpudct::cuda {
 
@@ -1207,6 +1209,341 @@ Status encode_bricks(const void* data, Dims dims, DType dtype, float scale, floa
     if (!overflowed) return s;
   }
   return Status::backend_unavailable;
+}
+
+// --------------------------------------------------------------------------
+// DeviceVolume: the compressed archive stays in VRAM and decoding writes
+// straight into device memory. See include/gpudct/device_volume.hpp.
+//
+// Everything the ordinary decode path redoes on every call -- uploading the
+// archive, allocating scratch, expanding entropy tables, parsing every brick
+// header on the host -- happens once here, at open time. What is left per call
+// is a small descriptor copy and the two kernels.
+// --------------------------------------------------------------------------
+
+struct DeviceVolumeImpl {
+  detail::FileHeader h{};
+  VolumeInfo info{};
+  Dims grid{};
+  std::uint32_t P = 0;
+  std::int32_t max_level = 0;
+  float lo = 0.0f, hi = 0.0f;
+  std::uint32_t max_nz = 0;
+  std::uint32_t batch = 0;
+  std::size_t device_bytes = 0;
+  std::size_t shared_limit = 48u << 10;
+  std::uint32_t max_tab_count = 0;
+
+  ModelUpload models_up;
+  DeviceModels dm{};
+
+  // Device memory owned for the object's lifetime.
+  std::uint8_t* d_archive = nullptr;
+  float* d_quant = nullptr;
+  std::uint32_t* d_error = nullptr;
+  std::uint32_t* d_tab_fc = nullptr;
+  std::uint8_t* d_tab_slot = nullptr;
+  // Per-call scratch, sized for `batch` bricks.
+  BrickDesc* d_descs = nullptr;
+  std::int16_t* d_levels = nullptr;
+  std::uint16_t* d_indices = nullptr;
+  std::uint32_t* d_counts = nullptr;
+  std::uint8_t* d_map = nullptr;
+  std::uint32_t* d_tab_base = nullptr;
+  std::uint32_t* d_tab_count = nullptr;
+
+  // Host-side metadata for every brick, gathered per call into the scratch.
+  std::vector<BrickDesc> descs;
+  std::vector<std::uint32_t> tab_base_all, tab_count_all;
+  std::vector<std::uint8_t> tab_map;
+
+  ~DeviceVolumeImpl() {
+    cudaFree(d_archive);
+    cudaFree(d_quant);
+    cudaFree(d_error);
+    cudaFree(d_tab_fc);
+    cudaFree(d_tab_slot);
+    cudaFree(d_descs);
+    cudaFree(d_levels);
+    cudaFree(d_indices);
+    cudaFree(d_counts);
+    cudaFree(d_map);
+    cudaFree(d_tab_base);
+    cudaFree(d_tab_count);
+  }
+};
+
+Status device_volume_open_impl(std::span<const std::uint8_t> archive,
+                               std::unique_ptr<DeviceVolumeImpl>& out) {
+  auto v = std::make_unique<DeviceVolumeImpl>();
+  if (const Status s = detail::read_header(archive, v->h); s != Status::ok) return s;
+  if (const Status s = inspect(archive, v->info); s != Status::ok) return s;
+  // A correction layer is not implemented on the device, and quietly dropping it
+  // would break the error bound the archive advertises.
+  if ((v->h.flags & detail::kFlagCorrections) != 0) return Status::backend_unavailable;
+  if (v->h.brick_count == 0) return Status::corrupt_bitstream;
+
+  int dev = 0;
+  if (cudaGetDevice(&dev) != cudaSuccess) return Status::backend_unavailable;
+  if (upload_transform_constants() != Status::ok) return Status::backend_unavailable;
+
+  const detail::QuantMatrix qm =
+      detail::QuantMatrix::build({v->h.q_base, v->h.q_a, v->h.q_b, v->h.deadzone});
+  const ModelSet ms = ModelSet::defaults(v->h.table_version);
+  if (upload_models(ms, v->models_up, v->dm) != Status::ok) return Status::backend_unavailable;
+
+  v->grid = brick_grid(v->h.dims);
+  v->P = v->h.streams_per_brick;
+  v->max_level = detail::max_plausible_level(qm);
+  v->lo = dtype_min(v->h.dtype);
+  v->hi = dtype_max(v->h.dtype);
+  // Sparse scratch is sized for typical chunk occupancy, not the worst case, and
+  // grown on demand. Sizing for 4096 nonzeros per chunk costs 8.4 MB of device
+  // memory per brick of batch -- which on a volume whose whole point is to stay
+  // compressed in VRAM is absurd: the scratch would dwarf the archive.
+  v->max_nz = kTypicalMaxNonzero;
+
+  if (cudaMalloc(&v->d_archive, archive.size()) != cudaSuccess ||
+      cudaMemcpy(v->d_archive, archive.data(), archive.size(), cudaMemcpyHostToDevice) !=
+          cudaSuccess)
+    return Status::out_of_memory;
+  v->device_bytes += archive.size();
+
+  const std::size_t nb = static_cast<std::size_t>(v->h.brick_count);
+  v->descs.resize(nb);
+  v->tab_base_all.assign(nb, 0);
+  v->tab_count_all.assign(nb, 0);
+  v->tab_map.assign(nb * detail::ModelIndex::total, detail::kUseGlobalTable);
+
+  std::vector<std::uint16_t> tab_freq;
+  for (std::size_t i = 0; i < nb; ++i) {
+    const std::size_t e =
+        static_cast<std::size_t>(v->h.index_offset) + i * detail::BrickEntry::kSize;
+    if (e + detail::BrickEntry::kSize > archive.size()) return Status::corrupt_bitstream;
+    const std::uint64_t off = detail::get_u64(archive, e);
+    const std::uint32_t size = detail::get_u32(archive, e + 8);
+    if (off > archive.size() || size > archive.size() - off) return Status::corrupt_bitstream;
+
+    detail::BrickTableView tv;
+    if (!parse_brick(archive.subspan(static_cast<std::size_t>(off), size), v->P, v->descs[i],
+                     reinterpret_cast<std::uint64_t>(v->d_archive) + off, tv))
+      return Status::backend_unavailable;  // raw brick or unsupported; caller falls back
+
+    v->tab_base_all[i] = static_cast<std::uint32_t>(tab_freq.size() / 256);
+    if (v->descs[i].has_tables) {
+      v->tab_count_all[i] = static_cast<std::uint32_t>(tv.freqs.size() / 256);
+      v->max_tab_count = std::max(v->max_tab_count, v->tab_count_all[i]);
+      tab_freq.insert(tab_freq.end(), tv.freqs.begin(), tv.freqs.end());
+      std::memcpy(v->tab_map.data() + i * detail::ModelIndex::total, tv.model_map.data(),
+                  detail::ModelIndex::total);
+    }
+  }
+
+  const std::uint32_t ntab = static_cast<std::uint32_t>(tab_freq.size() / 256);
+  if (ntab > 0) {
+    std::uint16_t* d_freq = nullptr;
+    const bool ok =
+        cudaMalloc(&d_freq, tab_freq.size() * 2) == cudaSuccess &&
+        cudaMalloc(&v->d_tab_fc, static_cast<std::size_t>(ntab) * 256 * 4) == cudaSuccess &&
+        cudaMalloc(&v->d_tab_slot, static_cast<std::size_t>(ntab) * kProbScale) == cudaSuccess &&
+        cudaMemcpy(d_freq, tab_freq.data(), tab_freq.size() * 2, cudaMemcpyHostToDevice) ==
+            cudaSuccess;
+    if (!ok) {
+      cudaFree(d_freq);
+      return Status::out_of_memory;
+    }
+    k0_build_brick_tables<<<ntab, 256>>>(d_freq, v->d_tab_fc, v->d_tab_slot, ntab);
+    const cudaError_t e = cudaDeviceSynchronize();
+    cudaFree(d_freq);
+    if (e != cudaSuccess) return Status::io_error;
+    v->device_bytes += static_cast<std::size_t>(ntab) * (256 * 4 + kProbScale);
+  }
+
+  // Batch size for the persistent scratch, which is what caps one call. The
+  // sparse coefficient buffers dominate it.
+  std::size_t free_mem = 0, total_mem = 0;
+  cudaMemGetInfo(&free_mem, &total_mem);
+  const std::size_t per_brick =
+      static_cast<std::size_t>(kChunksPerBrick) * v->max_nz * 4 +
+      static_cast<std::size_t>(kChunksPerBrick) * 4 + sizeof(BrickDesc) +
+      detail::ModelIndex::total + 8;
+  const std::size_t budget = (free_mem > (512u << 20)) ? (free_mem / 8) : (64u << 20);
+  // Capped at the shared-launch threshold as well as by memory: past it the
+  // low-latency kernel stops being the right one, and a caller asking for more
+  // bricks is served by looping rather than by a bigger allocation.
+  v->batch = static_cast<std::uint32_t>(std::clamp<std::size_t>(
+      budget / per_brick, 1, std::min<std::size_t>(nb, kSharedLaunchMaxBricks)));
+
+  const std::size_t b = v->batch;
+  if (cudaMalloc(&v->d_quant, kChunkVox * sizeof(float)) != cudaSuccess ||
+      cudaMemcpy(v->d_quant, qm.q.data(), kChunkVox * sizeof(float), cudaMemcpyHostToDevice) !=
+          cudaSuccess ||
+      cudaMalloc(&v->d_error, 4) != cudaSuccess ||
+      cudaMalloc(&v->d_descs, b * sizeof(BrickDesc)) != cudaSuccess ||
+      cudaMalloc(&v->d_levels, b * kChunksPerBrick * v->max_nz * 2) != cudaSuccess ||
+      cudaMalloc(&v->d_indices, b * kChunksPerBrick * v->max_nz * 2) != cudaSuccess ||
+      cudaMalloc(&v->d_counts, b * kChunksPerBrick * 4) != cudaSuccess ||
+      cudaMalloc(&v->d_map, b * detail::ModelIndex::total) != cudaSuccess ||
+      cudaMalloc(&v->d_tab_base, b * 4) != cudaSuccess ||
+      cudaMalloc(&v->d_tab_count, b * 4) != cudaSuccess)
+    return Status::out_of_memory;
+  v->device_bytes += b * (static_cast<std::size_t>(kChunksPerBrick) * v->max_nz * 4 +
+                          kChunksPerBrick * 4 + sizeof(BrickDesc) + detail::ModelIndex::total + 8);
+
+  int optin = 0;
+  if (cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev) ==
+          cudaSuccess &&
+      optin > 0 &&
+      cudaFuncSetAttribute(k1_entropy_decode_shared, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                           optin) == cudaSuccess)
+    v->shared_limit = static_cast<std::size_t>(optin);
+
+  out = std::move(v);
+  return Status::ok;
+}
+
+Status device_volume_decode_impl(DeviceVolumeImpl& v, std::span<const std::uint32_t> indices,
+                                 void* d_out) {
+  if (indices.empty()) return Status::ok;
+  if (d_out == nullptr) return Status::invalid_argument;
+  const std::size_t esz = dtype_size(v.h.dtype);
+  const std::size_t brick_vox = static_cast<std::size_t>(kBrickDim) * kBrickDim * kBrickDim;
+
+  std::vector<BrickDesc> bd;
+  std::vector<std::uint32_t> base, count;
+  std::vector<std::uint8_t> map;
+
+  for (std::size_t off = 0; off < indices.size(); off += v.batch) {
+    const std::uint32_t n =
+        static_cast<std::uint32_t>(std::min<std::size_t>(v.batch, indices.size() - off));
+    bd.clear();
+    base.clear();
+    count.clear();
+    map.clear();
+    // The kernels index their per-brick metadata by position within the batch,
+    // so the batch's rows are gathered densely here rather than indexed sparsely
+    // on the device. It is a few kilobytes per call.
+    for (std::uint32_t i = 0; i < n; ++i) {
+      const std::uint32_t bi = indices[off + i];
+      if (bi >= v.descs.size()) return Status::invalid_argument;
+      bd.push_back(v.descs[bi]);
+      base.push_back(v.tab_base_all[bi]);
+      count.push_back(v.tab_count_all[bi]);
+      map.insert(map.end(), v.tab_map.begin() + static_cast<std::ptrdiff_t>(bi) *
+                                                    detail::ModelIndex::total,
+                 v.tab_map.begin() +
+                     static_cast<std::ptrdiff_t>(bi + 1) * detail::ModelIndex::total);
+    }
+
+    if (cudaMemcpy(v.d_descs, bd.data(), n * sizeof(BrickDesc), cudaMemcpyHostToDevice) !=
+            cudaSuccess ||
+        cudaMemcpy(v.d_tab_base, base.data(), n * 4, cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(v.d_tab_count, count.data(), n * 4, cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(v.d_map, map.data(), map.size(), cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemset(v.d_error, 0, 4) != cudaSuccess ||
+        cudaMemset(v.d_counts, 0, static_cast<std::size_t>(n) * kChunksPerBrick * 4) !=
+            cudaSuccess)
+      return Status::io_error;
+
+    DeviceBrickTables bt{v.d_tab_fc, v.d_tab_slot, v.d_map, v.d_tab_base};
+    const std::size_t shared_bytes = static_cast<std::size_t>(v.max_tab_count) * kProbScale +
+                                     static_cast<std::size_t>(v.P) * kRansStates * 4 + 4;
+    if (n <= kSharedLaunchMaxBricks && v.P >= 32 && shared_bytes <= v.shared_limit) {
+      k1_entropy_decode_shared<<<n, v.P, shared_bytes>>>(
+          v.d_descs, v.dm, bt, v.d_tab_count, v.max_level, v.d_levels, v.d_indices, v.d_counts,
+          v.max_nz, n, v.d_error);
+    } else {
+      const std::uint32_t threads = n * v.P;
+      const std::uint32_t blocks = (threads + kK1Threads - 1) / kK1Threads;
+      k1_entropy_decode<<<blocks, kK1Threads>>>(v.d_descs, v.dm, bt, v.max_level, v.d_levels,
+                                                v.d_indices, v.d_counts, v.max_nz, v.P, n,
+                                                v.d_error);
+    }
+
+    std::uint8_t* dst = static_cast<std::uint8_t*>(d_out) + off * brick_vox * esz;
+    const dim3 blocks2(n * kChunksPerBrick);
+#define GPUDCT_DV_K2(T)                                                                       \
+  k2_inverse_transform<T><<<blocks2, 256>>>(v.d_levels, v.d_indices, v.d_counts, v.max_nz,    \
+                                            v.d_quant, v.h.data_scale, v.h.data_offset, v.lo, \
+                                            v.hi, reinterpret_cast<T*>(dst))
+    switch (v.h.dtype) {
+      case DType::u8:  GPUDCT_DV_K2(std::uint8_t); break;
+      case DType::s8:  GPUDCT_DV_K2(std::int8_t); break;
+      case DType::u16: GPUDCT_DV_K2(std::uint16_t); break;
+      case DType::s16: GPUDCT_DV_K2(std::int16_t); break;
+      case DType::u32: GPUDCT_DV_K2(std::uint32_t); break;
+      case DType::s32: GPUDCT_DV_K2(std::int32_t); break;
+      case DType::f32: GPUDCT_DV_K2(float); break;
+    }
+#undef GPUDCT_DV_K2
+
+    if (cudaDeviceSynchronize() != cudaSuccess) return Status::io_error;
+    std::uint32_t err = 0;
+    cudaMemcpy(&err, v.d_error, 4, cudaMemcpyDeviceToHost);
+    if (err == kErrOverflow) {
+      // A denser chunk than the scratch was sized for. Grow once to the format's
+      // worst case and redo this batch; the buffers persist, so a volume that
+      // needs the headroom pays for it once rather than per call.
+      if (v.max_nz >= static_cast<std::uint32_t>(kChunkVox)) return Status::corrupt_bitstream;
+      const std::uint32_t grown = kChunkVox;
+      std::int16_t* nl = nullptr;
+      std::uint16_t* ni = nullptr;
+      if (cudaMalloc(&nl, static_cast<std::size_t>(v.batch) * kChunksPerBrick * grown * 2) !=
+              cudaSuccess ||
+          cudaMalloc(&ni, static_cast<std::size_t>(v.batch) * kChunksPerBrick * grown * 2) !=
+              cudaSuccess) {
+        cudaFree(nl);
+        cudaFree(ni);
+        return Status::out_of_memory;
+      }
+      cudaFree(v.d_levels);
+      cudaFree(v.d_indices);
+      v.d_levels = nl;
+      v.d_indices = ni;
+      v.device_bytes += static_cast<std::size_t>(v.batch) * kChunksPerBrick *
+                        (grown - v.max_nz) * 4;
+      v.max_nz = grown;
+      off -= v.batch;  // redo this batch with the larger scratch
+      continue;
+    }
+    if (err != 0) return Status::corrupt_bitstream;
+  }
+  return Status::ok;
+}
+
+Status device_volume_open(std::span<const std::uint8_t> archive, DeviceVolumeImpl** out,
+                          DeviceVolumeInfo& summary) {
+  std::unique_ptr<DeviceVolumeImpl> v;
+  const Status s = device_volume_open_impl(archive, v);
+  if (s != Status::ok) return s;
+  summary.info = v->info;
+  summary.grid = v->grid;
+  summary.bricks = v->h.brick_count;
+  summary.batch = v->batch;
+  summary.device_bytes = v->device_bytes;
+  *out = v.release();
+  return Status::ok;
+}
+
+void device_volume_close(DeviceVolumeImpl* v) { delete v; }
+
+Status device_malloc(std::size_t bytes, void** out) {
+  if (out == nullptr) return Status::invalid_argument;
+  *out = nullptr;
+  return cudaMalloc(out, bytes) == cudaSuccess ? Status::ok : Status::out_of_memory;
+}
+
+void device_free(void* p) { cudaFree(p); }
+
+Status device_to_host(void* dst, const void* src, std::size_t bytes) {
+  return cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToHost) == cudaSuccess ? Status::ok
+                                                                            : Status::io_error;
+}
+
+Status device_volume_decode(DeviceVolumeImpl* v, std::span<const std::uint32_t> indices,
+                            void* d_out) {
+  if (v == nullptr) return Status::invalid_argument;
+  return device_volume_decode_impl(*v, indices, d_out);
 }
 
 #undef CUDA_OK

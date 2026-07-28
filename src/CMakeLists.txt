@@ -6,6 +6,7 @@ add_library(gpudct
   core/chunk_codec.cpp
   core/correction.cpp
   core/codec.cpp
+  core/device_volume.cpp
   metrics/metrics.cpp
 )
 

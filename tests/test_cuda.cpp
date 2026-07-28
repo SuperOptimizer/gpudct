@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cmath>
 
+#include "gpudct/device_volume.hpp"
 #include "gpudct/gpudct.hpp"
 #include "gpudct/metrics.hpp"
 #include "test.hpp"
@@ -284,3 +285,76 @@ TEST(cuda_decode_handles_per_brick_tables) {
 }
 
 TEST_MAIN()
+
+// DeviceVolume: the compressed archive stays in VRAM and decoding writes into
+// device memory. It must produce exactly what the ordinary GPU decoder does --
+// it runs the same two kernels, so any difference is a bug in the persistent
+// setup (table expansion, descriptor gathering, batch slicing), which is
+// precisely the part that is new.
+TEST(device_volume_matches_full_decode) {
+  if (!cuda_ready()) return;
+  const Volume v = scroll_like_volume({300, 260, 280});
+  const std::vector<std::uint8_t> raw = to_typed(v, DType::u8);
+  EncodeOptions opts;
+  opts.streams_per_brick = 64;  // the setting a VRAM-resident reader would use
+  std::vector<std::uint8_t> archive;
+  REQUIRE(encode(raw.data(), v.dims, DType::u8, opts, archive) == Status::ok);
+
+  std::vector<std::uint8_t> full;
+  VolumeInfo info;
+  REQUIRE(decode(archive, DecodeOptions{}, full, info, Backend::cuda) == Status::ok);
+
+  std::unique_ptr<DeviceVolume> dv;
+  const Status os = DeviceVolume::open(archive, dv);
+  if (os == Status::backend_unavailable) return;
+  REQUIRE(os == Status::ok);
+  REQUIRE(dv->brick_count() > 1);
+
+  const Dims grid = dv->brick_dims();
+  const std::size_t brick_vox = static_cast<std::size_t>(kBrickDim) * kBrickDim * kBrickDim;
+
+  // Ask for the bricks out of order and with a repeat: the output is defined to
+  // be dense in the order given, not in brick order, and nothing about the
+  // decode may depend on the request being sorted or unique.
+  std::vector<std::uint32_t> want;
+  for (std::uint32_t i = static_cast<std::uint32_t>(dv->brick_count()); i-- > 0;)
+    want.push_back(i);
+  want.push_back(0);
+
+  std::uint8_t* d_out = nullptr;
+  REQUIRE(DeviceVolume::device_malloc(want.size() * brick_vox,
+                                      reinterpret_cast<void**>(&d_out)) == Status::ok);
+  REQUIRE(dv->decode_bricks(want, d_out) == Status::ok);
+  std::vector<std::uint8_t> got(want.size() * brick_vox);
+  REQUIRE(DeviceVolume::device_to_host(got.data(), d_out, got.size()) == Status::ok);
+  DeviceVolume::device_free(d_out);
+
+  for (std::size_t k = 0; k < want.size(); ++k) {
+    const std::uint32_t bi = want[k];
+    const std::uint32_t bx = static_cast<std::uint32_t>(bi % grid.x);
+    const std::uint32_t by = static_cast<std::uint32_t>((bi / grid.x) % grid.y);
+    const std::uint32_t bz = static_cast<std::uint32_t>(bi / (grid.x * grid.y));
+    for (int z = 0; z < kBrickDim; ++z) {
+      const std::uint32_t gz = bz * kBrickDim + static_cast<std::uint32_t>(z);
+      if (gz >= v.dims.z) break;
+      for (int y = 0; y < kBrickDim; ++y) {
+        const std::uint32_t gy = by * kBrickDim + static_cast<std::uint32_t>(y);
+        if (gy >= v.dims.y) break;
+        for (int x = 0; x < kBrickDim; ++x) {
+          const std::uint32_t gx = bx * kBrickDim + static_cast<std::uint32_t>(x);
+          if (gx >= v.dims.x) break;
+          const std::size_t li =
+              k * brick_vox +
+              (static_cast<std::size_t>(z) * kBrickDim + static_cast<std::size_t>(y)) * kBrickDim +
+              static_cast<std::size_t>(x);
+          const std::size_t fi =
+              (static_cast<std::size_t>(gz) * v.dims.y + gy) * v.dims.x + gx;
+          if (got[li] != full[fi]) {
+            CHECK_EQ(static_cast<int>(got[li]), static_cast<int>(full[fi]));
+            return;
+          }
+        }
+      }
+    }
+  }
+}
