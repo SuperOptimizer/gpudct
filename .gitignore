@@ -53,3 +53,18 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# Build directories
+build/
+build-*/
+out/
+cmake-build-*/
+
+# Test corpus fetched by tools/fetch_corpus (large, not vendored)
+tests/data/corpus/
+*.raw
+*.gdct
+
+# Python bytecode from the bench scripts
+__pycache__/
+*.pyc
