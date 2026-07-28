@@ -64,6 +64,23 @@ static constexpr int kLevelCtxDev = gpudct::detail::kLevelCtxCount;
 // means lane L always touches bank (L mod 32), so a warp's accesses to the same
 // state index are conflict-free.
 static constexpr std::uint32_t kK1Threads = 128;
+
+// Batch size at which the flat K1 launch overtakes the per-brick one.
+//
+// Below it there are too few threads to hide the slot lookup's global latency
+// and staging the tables in shared memory wins; above it there is enough
+// occupancy to hide it, and the flat launch's better SM utilization wins.
+// Measured on K1 time alone, P=64, three reps each:
+//
+//   bricks    shared    flat
+//        8    5.52 ms   8.89 ms
+//       27    6.02 ms   9.87 ms
+//       64   11.96 ms   9.90 ms
+//
+// The crossover is between 27 and 64, so 32 is the threshold. Note how flat's
+// time barely moves across an 8x change in batch size -- it is bound by the
+// per-thread serial chain, not by throughput.
+static constexpr std::uint32_t kSharedLaunchMaxBricks = 32;
 static constexpr std::uint32_t kStateStride = kK1Threads;
 
 static constexpr int kLevelEscape = static_cast<int>(gpudct::detail::kLevelEscape);
@@ -78,8 +95,11 @@ static constexpr int kLenSyms = static_cast<int>(gpudct::detail::kLenSyms);
 // kUseGlobal falls back to the archive-wide table set, which is why the small,
 // stable models (bypass, chunk flag, exponent) cost nothing per brick.
 struct DeviceBrickTables {
-  const std::uint16_t* freqs;  // [brick_table_base + table][256]
-  const std::uint16_t* cum;    // same layout, exclusive prefix sums
+  // freq and cum packed into one word, exactly as DeviceModels does and for the
+  // same reason: the decoder needs both for every symbol, and two u16 arrays
+  // meant two dependent global loads on the hot path. Per-brick tables are the
+  // default, so this path is the hot one.
+  const std::uint32_t* fc;     // [brick_table_base + table][256], freq<<16 | cum
   const std::uint8_t* slot;    // [.. ][4096]
   const std::uint8_t* map;     // [brick][model] -> table index, or 0xff
   const std::uint32_t* base;   // [brick] -> first table index for that brick
@@ -123,6 +143,16 @@ struct Decoder {
   const DeviceBrickTables* bt;
   std::uint32_t bt_base;
   const std::uint8_t* bt_map;
+  // Block-local copy of this brick's slot tables, or null to read them from
+  // global memory.
+  //
+  // The slot lookup is the symbol decode's first dependent load and the one that
+  // matters: 4096 bytes per table, indexed by the rANS state's low bits, so the
+  // access is random and there is nothing to prefetch. At the batch sizes a
+  // VRAM-resident viewer decodes -- a few bricks, a few hundred threads -- there
+  // is no occupancy to hide that latency behind, and K1 becomes a chain of
+  // unhidden global round trips.
+  const std::uint8_t* sh_slot;
 
   const std::uint8_t* bytes;
   std::uint32_t size;
@@ -133,21 +163,25 @@ struct Decoder {
   // a local-memory read and write on every symbol, because an array indexed by a
   // runtime value cannot stay in registers.
   std::uint32_t* state;
+  std::uint32_t stride;
   bool failed;
 
-  __device__ bool init(const std::uint8_t* b, std::uint32_t n, std::uint32_t* state_pool) {
+  __device__ bool init(const std::uint8_t* b, std::uint32_t n, std::uint32_t* state_pool,
+                       std::uint32_t state_stride) {
     bt = nullptr;
     bt_base = 0;
     bt_map = nullptr;
+    sh_slot = nullptr;
     bytes = b;
     size = n;
     pos = 0;
     next = 0;
     failed = false;
     state = state_pool;
+    stride = state_stride;
     if (n < kRansStates * 4) return false;
     for (std::uint32_t i = 0; i < kRansStates; ++i) {
-      state[i * kStateStride] = static_cast<std::uint32_t>(bytes[pos]) |
+      state[i * stride] = static_cast<std::uint32_t>(bytes[pos]) |
                                 (static_cast<std::uint32_t>(bytes[pos + 1]) << 8) |
                                 (static_cast<std::uint32_t>(bytes[pos + 2]) << 16) |
                                 (static_cast<std::uint32_t>(bytes[pos + 3]) << 24);
@@ -158,7 +192,7 @@ struct Decoder {
 
   __device__ std::uint32_t decode(const DeviceModels& m, std::uint32_t model) {
     if (failed) return 0;
-    std::uint32_t x = state[next * kStateStride];
+    std::uint32_t x = state[next * stride];
     const std::uint32_t slot_v = x & kProbMask;
 
     std::uint32_t sym, freq, cum;
@@ -170,9 +204,11 @@ struct Decoder {
       cum = fc & 0xffffu;
     } else {
       const std::size_t ti = bt_base + t;
-      sym = bt->slot[ti * kProbScale + slot_v];
-      freq = bt->freqs[ti * 256 + sym];
-      cum = bt->cum[ti * 256 + sym];
+      sym = sh_slot ? sh_slot[static_cast<std::size_t>(t) * kProbScale + slot_v]
+                    : bt->slot[ti * kProbScale + slot_v];
+      const std::uint32_t bfc = bt->fc[ti * 256 + sym];
+      freq = bfc >> 16;
+      cum = bfc & 0xffffu;
     }
     x = freq * (x >> kProbBits) + slot_v - cum;
     while (x < kRansL) {
@@ -182,7 +218,7 @@ struct Decoder {
       }
       x = (x << 8) | bytes[pos++];
     }
-    state[next * kStateStride] = x;
+    state[next * stride] = x;
     if (++next == kRansStates) next = 0;
     return sym;
   }
@@ -194,7 +230,7 @@ struct Decoder {
   // available in this kernel.
   __device__ std::uint32_t decode_bypass(const DeviceModels&) {
     if (failed) return 0;
-    std::uint32_t x = state[next * kStateStride];
+    std::uint32_t x = state[next * stride];
     const std::uint32_t slot_v = x & kProbMask;
     const std::uint32_t bit = slot_v >> (kProbBits - 1);
     constexpr std::uint32_t kHalf = kProbScale / 2;
@@ -206,7 +242,7 @@ struct Decoder {
       }
       x = (x << 8) | bytes[pos++];
     }
-    state[next * kStateStride] = x;
+    state[next * stride] = x;
     if (++next == kRansStates) next = 0;
     return bit;
   }
@@ -300,7 +336,7 @@ __device__ __forceinline__ bool read_len_mag(Decoder& d, const DeviceModels& m, 
 // table per brick across the PCIe bus and through the CPU, for data that is
 // fully determined by the frequencies already being sent.
 __global__ void k0_build_brick_tables(const std::uint16_t* __restrict freqs,
-                                      std::uint16_t* __restrict cum,
+                                      std::uint32_t* __restrict fc,
                                       std::uint8_t* __restrict slot,
                                       std::uint32_t ntables) {
   const std::uint32_t t = blockIdx.x;
@@ -318,7 +354,9 @@ __global__ void k0_build_brick_tables(const std::uint16_t* __restrict freqs,
   __syncthreads();
 
   for (int i = static_cast<int>(threadIdx.x); i < 256; i += blockDim.x)
-    cum[static_cast<std::size_t>(t) * 256 + i] = sh_cum[i];
+    fc[static_cast<std::size_t>(t) * 256 + i] =
+        (static_cast<std::uint32_t>(freqs[static_cast<std::size_t>(t) * 256 + i]) << 16) |
+        sh_cum[i];
 
   // Fill slot[] by binary searching the cumulative table: a linear scan per slot
   // would be 256x the work and this runs once per table, not per symbol.
@@ -334,44 +372,21 @@ __global__ void k0_build_brick_tables(const std::uint16_t* __restrict freqs,
   }
 }
 
-__global__ void k1_entropy_decode(const BrickDesc* __restrict bricks,
-                                  DeviceModels models, DeviceBrickTables btables,
-                                  std::int32_t max_level,
-                                  std::int16_t* __restrict out_levels,
-                                  std::uint16_t* __restrict out_indices,
-                                  std::uint32_t* __restrict out_counts,
-                                  std::uint32_t max_nonzero_per_chunk,
-                                  std::uint32_t streams_per_brick, std::uint32_t brick_count,
-                                  std::uint32_t* __restrict error_flag) {
-  // One thread per (brick, stream) pair, flattened. A 2-D grid keyed on the
-  // stream index wasted most of every warp whenever P was smaller than the block
-  // width, which is the common case.
-  __shared__ std::uint32_t sh_state[kRansStates * kK1Threads];
-
-  const std::uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-  const std::uint32_t P = streams_per_brick;
-  const std::uint32_t b = tid / P;
-  const std::uint32_t s = tid % P;
-  if (b >= brick_count) return;
-
-  const BrickDesc& bd = bricks[b];
-  if (s >= bd.streams) return;
-  if (bd.mode != 0) return;  // raw bricks are handled on the host
-
-  Decoder d;
-  if (!d.init(bd.payload + bd.stream_offset[s], bd.stream_size[s],
-              sh_state + threadIdx.x)) {
-    atomicExch(error_flag, 1u);
-    return;
-  }
-  if (bd.has_tables) {
-    d.bt = &btables;
-    d.bt_base = btables.base[b];
-    d.bt_map = btables.map + static_cast<std::size_t>(b) * kModelTotalDev;
-  }
-
+// The per-stream decode body, shared by both K1 launches.
+//
+// Split out so the flat launch (one thread per brick-stream pair, best for bulk
+// throughput) and the per-brick launch (one block per brick, which can stage the
+// brick's slot tables in shared memory) cannot drift apart. They differ only in
+// how a thread finds its stream and where the slot tables live.
+__device__ void k1_decode_stream(Decoder& d, const DeviceModels& models, std::uint32_t b,
+                                 std::uint32_t s, std::uint32_t streams,
+                                 std::int32_t max_level, std::int16_t* __restrict out_levels,
+                                 std::uint16_t* __restrict out_indices,
+                                 std::uint32_t* __restrict out_counts,
+                                 std::uint32_t max_nonzero_per_chunk,
+                                 std::uint32_t* __restrict error_flag) {
   for (int ci = static_cast<int>(s); ci < kChunksPerBrick;
-       ci += static_cast<int>(bd.streams)) {
+       ci += static_cast<int>(streams)) {
     const std::size_t chunk_slot =
         (static_cast<std::size_t>(b) * kChunksPerBrick + ci) * max_nonzero_per_chunk;
     std::uint32_t n = 0;
@@ -458,6 +473,108 @@ __global__ void k1_entropy_decode(const BrickDesc* __restrict bricks,
 
   // Do not clobber an overflow report with a generic failure.
   if (d.failed) atomicCAS(error_flag, 0u, 1u);
+}
+
+__global__ void k1_entropy_decode(const BrickDesc* __restrict bricks,
+                                  DeviceModels models, DeviceBrickTables btables,
+                                  std::int32_t max_level,
+                                  std::int16_t* __restrict out_levels,
+                                  std::uint16_t* __restrict out_indices,
+                                  std::uint32_t* __restrict out_counts,
+                                  std::uint32_t max_nonzero_per_chunk,
+                                  std::uint32_t streams_per_brick, std::uint32_t brick_count,
+                                  std::uint32_t* __restrict error_flag) {
+  // One thread per (brick, stream) pair, flattened. A 2-D grid keyed on the
+  // stream index wasted most of every warp whenever P was smaller than the block
+  // width, which is the common case.
+  __shared__ std::uint32_t sh_state[kRansStates * kK1Threads];
+
+  const std::uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+  const std::uint32_t P = streams_per_brick;
+  const std::uint32_t b = tid / P;
+  const std::uint32_t s = tid % P;
+  if (b >= brick_count) return;
+
+  const BrickDesc& bd = bricks[b];
+  if (s >= bd.streams) return;
+  if (bd.mode != 0) return;  // raw bricks are handled on the host
+
+  Decoder d;
+  if (!d.init(bd.payload + bd.stream_offset[s], bd.stream_size[s], sh_state + threadIdx.x,
+              kK1Threads)) {
+    atomicExch(error_flag, 1u);
+    return;
+  }
+  if (bd.has_tables) {
+    d.bt = &btables;
+    d.bt_base = btables.base[b];
+    d.bt_map = btables.map + static_cast<std::size_t>(b) * kModelTotalDev;
+  }
+
+  k1_decode_stream(d, models, b, s, bd.streams, max_level, out_levels, out_indices, out_counts,
+                   max_nonzero_per_chunk, error_flag);
+}
+
+// K1, one block per brick, with the brick's slot tables staged in shared memory.
+//
+// This is the low-latency launch. The flat launch above is right when there are
+// thousands of bricks in flight and the device is saturated; it is wrong when a
+// viewer asks for eight bricks, because then there are only `bricks * P` threads
+// -- a few hundred -- and every symbol's slot lookup is an unhidden global round
+// trip. Staging the tables costs one coalesced copy per block and turns that
+// lookup into a shared-memory read for the whole brick.
+//
+// Dynamic shared memory holds the slot tables followed by the rANS state pool.
+// A brick carries at most kMaxBrickTables tables, so the host checks the size
+// fits the device before choosing this launch and falls back if it does not.
+__global__ void k1_entropy_decode_shared(const BrickDesc* __restrict bricks,
+                                         DeviceModels models, DeviceBrickTables btables,
+                                         const std::uint32_t* __restrict tab_count,
+                                         std::int32_t max_level,
+                                         std::int16_t* __restrict out_levels,
+                                         std::uint16_t* __restrict out_indices,
+                                         std::uint32_t* __restrict out_counts,
+                                         std::uint32_t max_nonzero_per_chunk,
+                                         std::uint32_t brick_count,
+                                         std::uint32_t* __restrict error_flag) {
+  extern __shared__ std::uint8_t sh_raw[];
+
+  const std::uint32_t b = blockIdx.x;
+  if (b >= brick_count) return;
+  const BrickDesc& bd = bricks[b];
+
+  // Every thread must reach the barrier, so the staging loop runs before any
+  // early return -- including for raw bricks and for threads past bd.streams.
+  const std::uint32_t nt = (bd.has_tables && bd.mode == 0) ? tab_count[b] : 0;
+  const std::size_t slot_bytes = static_cast<std::size_t>(nt) * kProbScale;
+  if (nt > 0) {
+    const std::uint8_t* src = btables.slot + static_cast<std::size_t>(btables.base[b]) * kProbScale;
+    for (std::size_t i = threadIdx.x; i < slot_bytes; i += blockDim.x) sh_raw[i] = src[i];
+  }
+  // The state pool follows the tables, aligned to 4 bytes.
+  const std::size_t state_off = (slot_bytes + 3u) & ~std::size_t{3};
+  std::uint32_t* sh_state = reinterpret_cast<std::uint32_t*>(sh_raw + state_off);
+  __syncthreads();
+
+  const std::uint32_t s = threadIdx.x;
+  if (bd.mode != 0) return;  // raw bricks are handled on the host
+  if (s >= bd.streams) return;
+
+  Decoder d;
+  if (!d.init(bd.payload + bd.stream_offset[s], bd.stream_size[s], sh_state + threadIdx.x,
+              blockDim.x)) {
+    atomicExch(error_flag, 1u);
+    return;
+  }
+  if (bd.has_tables) {
+    d.bt = &btables;
+    d.bt_base = btables.base[b];
+    d.bt_map = btables.map + static_cast<std::size_t>(b) * kModelTotalDev;
+    if (nt > 0) d.sh_slot = sh_raw;
+  }
+
+  k1_decode_stream(d, models, b, s, bd.streams, max_level, out_levels, out_indices, out_counts,
+                   max_nonzero_per_chunk, error_flag);
 }
 
 // --------------------------------------------------------------------------

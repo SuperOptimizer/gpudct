@@ -615,3 +615,70 @@ The comparison that prompted this: fenix decodes a 64^3 brick and caches 16^3
 chunks, so a cache miss costs a 256 KiB decode. A 128^3 brick makes that 2 MiB,
 8x worse -- which was a real deficiency until the prefix walk existed. With it, a
 miss costs 1.29 ms against fenix's brick decode rather than 20.8 ms.
+
+### Decode latency, which is a different problem from decode throughput
+
+The target use case is a viewer keeping the volume *compressed* in VRAM and
+decoding the visible working set on demand, so effective VRAM is `ratio` times
+larger. What matters there is not GB/s on a gigabyte batch but the latency of
+decoding a handful of bricks. Those turn out to be almost unrelated numbers, and
+every optimization in this file up to this point was aimed at the wrong one.
+
+Decode of a batch, K1 time, at the default 16 streams:
+
+| batch | K1 | end to end |
+|---|---|---|
+| 8 bricks (16 MiB) | 34.7 ms | 386 MB/s |
+| 512 bricks (1 GiB) | 45.4 ms | 1992 MB/s |
+
+K1 barely changes across a 64x change in batch size, because its wall time is set
+by the **per-thread serial chain**, not by total work: each thread decodes
+`512/P` chunks one after another, and a chunk is a data-dependent rANS parse. At
+8 bricks there are `8 * P` threads on a device with ~10,000 lanes, so none of the
+per-symbol memory latency is hidden.
+
+Two consequences, both measured.
+
+**`P` is a latency knob, and a strong one.** K1 time falls as `1/P` almost
+exactly, because it divides the serial chain:
+
+| P (8 bricks) | K1 | ratio |
+|---|---|---|
+| 16 | 34.7 ms | 13.23x |
+| 32 | 18.2 ms | 13.21x |
+| 64 | 8.9 ms | 13.16x |
+
+4x lower latency for 0.5% of ratio. This is invisible in the throughput benchmark
+-- at 1024^3 the three values are within noise of each other -- which is why it
+went unnoticed for so long. `P=64` is the practical end of the lever: one stream
+per chunk would cost roughly 6% of ratio in flush overhead.
+
+**Slot tables belong in shared memory when the batch is small.** The symbol
+decode's first dependent load is `slot[table][state & 0xfff]` -- 4096 bytes per
+table, randomly indexed, nothing to prefetch. `k1_entropy_decode_shared` gives
+each block one brick and stages that brick's slot tables in shared memory:
+
+| bricks | shared | flat |
+|---|---|---|
+| 8 | **5.52 ms** | 8.89 ms |
+| 27 | **6.02 ms** | 9.87 ms |
+| 64 | 11.96 ms | **9.90 ms** |
+
+Below the crossover it is ~39% faster; above it, the flat launch's occupancy
+wins. The host picks by brick count (`kSharedLaunchMaxBricks = 32`).
+
+Together, decoding 8 bricks went from **34.7 ms to 5.52 ms of K1**, and 386 to
+1078 MB/s end to end.
+
+Also tried and measured neutral: packing the per-brick `freq`/`cum` into one word
+the way the global tables already do. It removes a load per symbol and changed
+nothing (8.93 vs 8.91 ms), which says those two arrays were already cache-
+resident -- 16 KB per brick, shared by every thread in the block. The slot table
+is 64 KB and is not. The change was kept anyway, because one packed array is
+simpler than two parallel ones and symmetric with `DeviceModels`.
+
+A measurement note: an early 27-brick reading showed 66 ms for the shared launch
+and did not reproduce -- three clean reps gave 6.0 ms. It was taken immediately
+after generating the test volume with a slow script, so the machine was still
+busy. A number that disagrees with its neighbours by 10x is a bad measurement
+until proven otherwise; it should not be reasoned about.

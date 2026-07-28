@@ -345,10 +345,11 @@ Status decode_archive_attempt(std::span<const std::uint8_t> archive, const FileH
   std::uint8_t* d_volume = nullptr;
   std::uint32_t* d_origins = nullptr;
   std::uint16_t* d_tab_freq = nullptr;
-  std::uint16_t* d_tab_cum = nullptr;
+  std::uint32_t* d_tab_fc = nullptr;
   std::uint8_t* d_tab_slot = nullptr;
   std::uint8_t* d_tab_map = nullptr;
   std::uint32_t* d_tab_base = nullptr;
+  std::uint32_t* d_tab_count = nullptr;
 
   auto cleanup = [&] {
     if (host_pinned && host_bricks) cudaFreeHost(host_bricks);
@@ -363,10 +364,11 @@ Status decode_archive_attempt(std::span<const std::uint8_t> archive, const FileH
     cudaFree(d_volume);
     cudaFree(d_origins);
     cudaFree(d_tab_freq);
-    cudaFree(d_tab_cum);
+    cudaFree(d_tab_fc);
     cudaFree(d_tab_slot);
     cudaFree(d_tab_map);
     cudaFree(d_tab_base);
+    cudaFree(d_tab_count);
     cudaFree(d_quant);
     cudaFree(d_archive);
   };
@@ -388,10 +390,11 @@ Status decode_archive_attempt(std::span<const std::uint8_t> archive, const FileH
       cudaMalloc(&d_descs, batch * sizeof(BrickDesc)) != cudaSuccess ||
       cudaMalloc(&d_error, 4) != cudaSuccess ||
       cudaMalloc(&d_tab_freq, batch * detail::kMaxBrickTables * 256 * 2) != cudaSuccess ||
-      cudaMalloc(&d_tab_cum, batch * detail::kMaxBrickTables * 256 * 2) != cudaSuccess ||
+      cudaMalloc(&d_tab_fc, batch * detail::kMaxBrickTables * 256 * 4) != cudaSuccess ||
       cudaMalloc(&d_tab_slot, batch * detail::kMaxBrickTables * kProbScale) != cudaSuccess ||
       cudaMalloc(&d_tab_map, batch * detail::ModelIndex::total) != cudaSuccess ||
-      cudaMalloc(&d_tab_base, batch * 4) != cudaSuccess) {
+      cudaMalloc(&d_tab_base, batch * 4) != cudaSuccess ||
+      cudaMalloc(&d_tab_count, batch * 4) != cudaSuccess) {
     cleanup();
     return Status::out_of_memory;
   }
@@ -404,10 +407,29 @@ Status decode_archive_attempt(std::span<const std::uint8_t> archive, const FileH
   std::vector<std::uint16_t> tab_freq;
   std::vector<std::uint8_t> tab_map;
   std::vector<std::uint32_t> tab_base;
+  std::vector<std::uint32_t> tab_count;
   tab_freq.reserve(batch * detail::kMaxBrickTables * 256);
 
   const float lo = dtype_min(h.dtype), hi = dtype_max(h.dtype);
   const std::int32_t max_level = detail::max_plausible_level(qm);
+
+  // Per-block shared memory available for the low-latency K1 launch. The default
+  // cap is 48 KB; a brick's slot tables can want more than that, so the opt-in
+  // limit is requested once and the launch falls back to the flat kernel if the
+  // device will not give it.
+  std::size_t shared_limit = 48u << 10;
+  {
+    int dev = 0, per_block_optin = 0;
+    if (cudaGetDevice(&dev) == cudaSuccess &&
+        cudaDeviceGetAttribute(&per_block_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev) ==
+            cudaSuccess &&
+        per_block_optin > 0) {
+      if (cudaFuncSetAttribute(k1_entropy_decode_shared,
+                               cudaFuncAttributeMaxDynamicSharedMemorySize,
+                               per_block_optin) == cudaSuccess)
+        shared_limit = static_cast<std::size_t>(per_block_optin);
+    }
+  }
 
   for (std::uint64_t b0 = 0; b0 < h.brick_count; b0 += batch) {
     const std::uint32_t n = static_cast<std::uint32_t>(
@@ -417,6 +439,8 @@ Status decode_archive_attempt(std::span<const std::uint8_t> archive, const FileH
 
     tab_freq.clear();
     tab_base.assign(n, 0);
+    tab_count.assign(n, 0);
+    std::uint32_t max_tab_count = 0;
     tab_map.assign(static_cast<std::size_t>(n) * detail::ModelIndex::total,
                    detail::kUseGlobalTable);
 
@@ -439,7 +463,10 @@ Status decode_archive_attempt(std::span<const std::uint8_t> archive, const FileH
         return Status::backend_unavailable;
       }
       tab_base[i] = static_cast<std::uint32_t>(tab_freq.size() / 256);
+      tab_count[i] = 0;
       if (descs[i].has_tables) {
+        tab_count[i] = static_cast<std::uint32_t>(tv.freqs.size() / 256);
+        max_tab_count = std::max(max_tab_count, tab_count[i]);
         tab_freq.insert(tab_freq.end(), tv.freqs.begin(), tv.freqs.end());
         std::memcpy(tab_map.data() + static_cast<std::size_t>(i) * detail::ModelIndex::total,
                     tv.model_map.data(), detail::ModelIndex::total);
@@ -471,11 +498,13 @@ Status decode_archive_attempt(std::span<const std::uint8_t> archive, const FileH
         cleanup();
         return Status::io_error;
       }
-      k0_build_brick_tables<<<ntab, 256>>>(d_tab_freq, d_tab_cum, d_tab_slot, ntab);
+      k0_build_brick_tables<<<ntab, 256>>>(d_tab_freq, d_tab_fc, d_tab_slot, ntab);
     }
     if (cudaMemcpy(d_tab_map, tab_map.data(), tab_map.size(), cudaMemcpyHostToDevice) !=
             cudaSuccess ||
         cudaMemcpy(d_tab_base, tab_base.data(), n * 4, cudaMemcpyHostToDevice) !=
+            cudaSuccess ||
+        cudaMemcpy(d_tab_count, tab_count.data(), n * 4, cudaMemcpyHostToDevice) !=
             cudaSuccess ||
         cudaMemcpy(d_descs, descs.data(), n * sizeof(BrickDesc), cudaMemcpyHostToDevice) !=
             cudaSuccess ||
@@ -489,12 +518,35 @@ Status decode_archive_attempt(std::span<const std::uint8_t> archive, const FileH
     prep.stop();
     timer.mark(timer.a);
     {
-      const std::uint32_t total_threads = n * h.streams_per_brick;
-      const std::uint32_t blocks = (total_threads + kK1Threads - 1) / kK1Threads;
-      DeviceBrickTables bt{d_tab_freq, d_tab_cum, d_tab_slot, d_tab_map, d_tab_base};
-      k1_entropy_decode<<<blocks, kK1Threads>>>(d_descs, dm, bt, max_level, d_levels,
-                                                d_indices, d_counts, max_nz,
-                                                h.streams_per_brick, n, d_error);
+      DeviceBrickTables bt{d_tab_fc, d_tab_slot, d_tab_map, d_tab_base};
+      // Two launches, chosen by what limits this batch.
+      //
+      // The flat one maximizes occupancy and wins when there are enough bricks
+      // to saturate the device. The per-brick one gives each block its own
+      // shared-memory copy of the brick's slot tables, which is worth far more
+      // when a batch is small: with a handful of bricks there are only a few
+      // hundred threads and nothing hides the slot lookup's global latency.
+      //
+      // The crossover is on brick count, and P has to be at least a warp for the
+      // per-brick launch not to waste most of every block.
+      const std::size_t shared_bytes =
+          static_cast<std::size_t>(max_tab_count) * kProbScale +
+          static_cast<std::size_t>(h.streams_per_brick) * kRansStates * 4 + 4;
+      static const bool no_shared = std::getenv("GPUDCT_NO_SHARED_K1") != nullptr;
+      const bool use_shared = !no_shared && n <= kSharedLaunchMaxBricks &&
+                              h.streams_per_brick >= 32 &&
+                              shared_bytes <= shared_limit;
+      if (use_shared) {
+        k1_entropy_decode_shared<<<n, h.streams_per_brick, shared_bytes>>>(
+            d_descs, dm, bt, d_tab_count, max_level, d_levels, d_indices, d_counts, max_nz, n,
+            d_error);
+      } else {
+        const std::uint32_t total_threads = n * h.streams_per_brick;
+        const std::uint32_t blocks = (total_threads + kK1Threads - 1) / kK1Threads;
+        k1_entropy_decode<<<blocks, kK1Threads>>>(d_descs, dm, bt, max_level, d_levels,
+                                                  d_indices, d_counts, max_nz,
+                                                  h.streams_per_brick, n, d_error);
+      }
     }
 
     timer.mark(timer.b);
