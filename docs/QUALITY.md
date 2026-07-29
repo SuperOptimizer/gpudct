@@ -122,6 +122,83 @@ We only get to claim "high ratio" relative to something. Every RD sweep runs aga
 Success criterion for M8: beat 3ddct's ratio at equal 3D-SSIM, at ≥ 5× its throughput
 on CPU and ≥ 50× on GPU.
 
+### 2.1 NVENC / NVDEC — the fixed-function baseline
+
+A GPU already contains silicon that compresses 8-bit images. If a volume is fed to it
+as video (z becomes time), how much does a purpose-built 3D codec actually add? Run
+`bench/nvcodec_bench.py`; measured on an RTX 5080 Laptop, driver 610.88, against
+`big512.raw` (512³ u8).
+
+**Rate-distortion is close to a wash.** BD-rate of gpudct (convex hull of the three
+profiles) against each hardware codec, negative meaning gpudct needs fewer bits:
+
+| codec | brick | overlap | BD-rate |
+|---|---|---|---|
+| HEVC | 256³ | 26.9–46.6 dB | −2.0% |
+| HEVC | 512³ | 26.9–46.6 dB | **+1.1%** |
+| AV1 | 256³ | 42.4–54.3 dB | −10.2% |
+| AV1 | 512³ | 42.4–54.3 dB | −9.8% |
+
+The single number hides a crossover, which is the more useful result — HEVC wins below
+~36 dB, gpudct wins above it, and the gap widens in both directions:
+
+| PSNR | gpudct | HEVC 512³ | AV1 512³ |
+|---|---|---|---|
+| 30 dB | 73.1× | **88.4×** | — |
+| 36 dB | 28.6× | 29.5× | — |
+| 42 dB | **13.4×** | 11.6× | — |
+| 48 dB | **6.5×** | — | 5.8× |
+
+So on ratio alone, hardware HEVC is a genuine peer and beats us at viewing quality.
+What gpudct wins on is everything else:
+
+**Speed.** Decode, device-resident in both cases (NVDEC via `-hwaccel cuda`, gpudct via
+`DeviceVolume`, neither copying back):
+
+| | latency | rate |
+|---|---|---|
+| gpudct, 32×128³ bricks | 6.5 ms | **10.4 GB/s** |
+| gpudct, 1×128³ brick | 5.5 ms | 381 MB/s |
+| NVDEC HEVC, 1×512³ | 92–171 ms | 0.79–1.46 GB/s |
+| NVDEC HEVC, 1×256³ | 48–55 ms | 0.24–0.35 GB/s |
+
+Encode is the same story: gpudct 608 MB/s against NVENC's 170 MB/s at `p7` and 304 MB/s
+at `p1` — the ASIC is *slower* than our kernels here, because these frames are small and
+NVENC's throughput is dominated by per-frame fixed cost rather than pixel count.
+
+**Granularity, which is the real disqualifier.** NVENC will not encode a frame below
+129×129 (145 for H.264) and **NVDEC will not decode one below 144×144**. A 128³ brick
+cannot pass through the hardware video path at all without being padded 1.27× in pixels.
+Random access is also inherently unavailable: reaching slice 400 of a clip means decoding
+400 frames, whereas a gpudct brick is independently decodable by construction and
+`decode_chunk` reaches 1/P of a brick.
+
+Caveats, so these numbers are not over-read: the harness drives ffmpeg, whose per-frame
+CPU work means the NVDEC figures are a **floor on the silicon, not its ceiling**; encode
+throughput repeated at ±30% across runs (p7 measured 170 and 230 MB/s on two occasions),
+so only the order of magnitude is meaningful; and `big512.raw` is isotropic
+(slice-to-slice MAE 8.97 ≈ in-plane 8.94), which is fair to a video codec but is not real
+scroll CT. Re-run on the Vesuvius corpus before quoting any of this externally.
+
+**Settings were tuned, not defaulted** — two BD-rate sweeps over 25 configurations. Three
+results worth keeping:
+
+- **Monochrome is a trap.** `-pix_fmt gray` (HEVC Rext) is accepted by NVENC and decoded
+  by NVDEC, and costs **+85% bitrate** at equal PSNR. Its mono path is far worse than
+  4:2:0, whose two flat chroma planes are nearly free; yuv444p ties 4:2:0 to within 0.01%.
+- **Hierarchical B-frames are the biggest lever.** Disabling them costs +13%; referencing
+  half of them (`-b_ref_mode middle`) rather than all is worth −12.8%.
+- **`-tune uhq` is incompatible with B-frames** on this driver at every resolution up to
+  512×512, and B-frames are worth far more, so `-tune hq` is correct.
+
+One measurement bug is recorded here because it nearly became a published conclusion:
+`av1_nvenc` does not preserve the full-range flag that HEVC does, so the decoder expands
+16–235 to 0–255. That is an affine distortion, not a coding loss, and it pinned AV1's
+apparent PSNR at 28.9 dB *regardless of QP* while ratio moved 5×→13×. A quantizer that
+changes rate without changing distortion is impossible; that impossibility is what
+exposed it. Fitting `orig = 0.863·dec + 15.5` confirmed the 255/219 range ratio, and
+`-vf scale=in_range=full:out_range=full` recovered the missing **18 dB**.
+
 ---
 
 ## 3. Test corpus
