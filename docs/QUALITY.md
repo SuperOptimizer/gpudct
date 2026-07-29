@@ -193,17 +193,32 @@ Varying one axis at a time on the same voxels:
 | frame size, 256² → 1024² (16× the pixels) | +1.9% | +7.6% |
 | clip length, 32 → 1024 frames (32× longer) | +5.6% | +16.0% |
 
-Both are weak, and length saturates past ~128 frames. A 32-frame clip of 256² frames — a
-~2 MB independently-decodable unit, the size of one gpudct brick — reaches 20.83× at
-38.0 dB, against our balanced profile's 20.88× at 38.4 dB. **At matched random-access
-granularity the two are even on ratio.** The 64× granularity sacrifice buys HEVC 3–10%,
-not the large win the framing assumed.
+Both are weak, and length saturates past ~128 frames. The 64× granularity sacrifice buys
+HEVC 3–10%, not the large win the framing assumed — so a video codec gives up much less
+by working in small units than expected, and correspondingly gains much less from being
+handed the whole volume.
 
-So the differentiators are not ratio-at-granularity. They are:
+That does *not* make the two even, though, which an earlier revision of this section
+concluded by comparing our 128³ brick against HEVC clips of 256³ and up. Held to the same
+128³ unit, HEVC manages 17.83× at 37.64 dB against our ~23.2× — see the granularity note
+below. The differentiators:
 
 - **NVENC will not encode a frame below 129×129** (145 for H.264) and **NVDEC will not
-  decode one below 144×144**. A 128³ brick cannot pass through the hardware video path
-  at all without a 1.27× pixel pad — the hardware simply does not operate at this size.
+  decode one below 144×144** (142² fails, 144² works; depth is unconstrained). A 128³
+  brick therefore cannot be a frame. It *can* be padded to 144² and trimmed after
+  decoding, and that costs only **2.6%** (18.31× → 17.83× at qp24), so this is a real
+  workaround rather than a wall — an earlier revision of this section overstated it as
+  one. What it does mean is that the comparison at *matched* 128³ granularity is
+  **17.83× at 37.64 dB for HEVC against ~23.2× for gpudct, about 30% in our favour**.
+  The apparent tie above comes from letting HEVC use 256³ and larger units.
+
+  Padding must be edge-replicated, not a real apron of neighbouring voxels. Carrying a
+  true 8-voxel apron costs 39% ratio against replication (12.86× vs 17.83×) and buys
+  no quality whatsoever: edge PSNR already equals core PSNR (37.63 vs 37.56), because
+  HEVC extends boundaries internally for intra prediction, so there is no edge
+  degradation to correct. Replicated padding is nearly free to code — a constant
+  extension is perfectly predicted — while apron voxels are real content at full price,
+  duplicated into all six neighbours.
 - **Access within a clip is still sequential.** Reaching slice 400 means decoding 400
   frames regardless of how short the clip is, whereas a gpudct brick is one dispatch and
   `decode_chunk` reaches 1/P of a brick.
