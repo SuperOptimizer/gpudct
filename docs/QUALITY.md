@@ -129,8 +129,40 @@ as video (z becomes time), how much does a purpose-built 3D codec actually add? 
 `bench/nvcodec_bench.py`; measured on an RTX 5080 Laptop, driver 610.88, against
 `big512.raw` (512³ u8).
 
-**Rate-distortion is close to a wash.** BD-rate of gpudct (convex hull of the three
-profiles) against each hardware codec, negative meaning gpudct needs fewer bits:
+**Rate-distortion is close to a wash, and the test volume decides the sign.** Three
+datasets, BD-rate of gpudct's convex hull against HEVC at a 512^3 clip:
+
+| data | BD-rate | |
+|---|---|---|
+| synthetic `big512.raw` | +1.1% | tie |
+| real, PHerc0332 **L3** (8x downsampled, 25% masked zeros) | **+23.5%** | HEVC wins clearly |
+| real, PHercParis4 **L0** (2.4um full-res, 100% content) | **+0.1%** | tie |
+
+The L3 number is the outlier and must not be quoted as the real-data verdict: 8x
+downsampling has already removed the high-frequency content the transform feeds on. The
+3ddct comparison below shows the identical collapse on the identical volume (-8.29% at L3
+against -27.65% at full resolution), which is what makes downsampled data a systematically
+misleading benchmark for this codec rather than merely a harder one.
+
+On full-resolution scroll CT -- the data that matters -- the crossover is what to
+remember, not the aggregate:
+
+| PSNR | gpudct | HEVC 512^3 | |
+|---|---|---|---|
+| 32 dB | 212x | **271x** | HEVC +28% |
+| 36 dB | 86.7x | 93.7x | HEVC +8% |
+| 39 dB | **47.4x** | 46.7x | +2% |
+| 42 dB | **27.4x** | 24.5x | **+12%** |
+| 45 dB | **16.2x** | 13.4x | **+21%** |
+
+We win where the archive would actually sit and lose below 36 dB, which is lossy enough
+that downstream ink detection is likely compromised regardless.
+
+Detail from the synthetic volume follows; its per-codec table is retained because the
+settings sweeps and the AV1 range bug were found on it.
+
+BD-rate of gpudct against each hardware codec on `big512.raw`, negative meaning gpudct
+needs fewer bits:
 
 | codec | brick | overlap | BD-rate |
 |---|---|---|---|
