@@ -244,17 +244,60 @@ below. The differentiators:
   **17.83× at 37.64 dB for HEVC against ~23.2× for gpudct, about 30% in our favour**.
   The apparent tie above comes from letting HEVC use 256³ and larger units.
 
-  Padding must be edge-replicated, not a real apron of neighbouring voxels. Carrying a
-  true 8-voxel apron costs 39% ratio against replication (12.86× vs 17.83×) and buys
-  no quality whatsoever: edge PSNR already equals core PSNR (37.63 vs 37.56), because
-  HEVC extends boundaries internally for intra prediction, so there is no edge
-  degradation to correct. Replicated padding is nearly free to code — a constant
-  extension is perfectly predicted — while apron voxels are real content at full price,
-  duplicated into all six neighbours.
+  An apron of real neighbouring voxels *is* required, and an earlier revision of this
+  section concluded the opposite from a metric that could not see the effect. Comparing
+  edge PSNR against core PSNR inside one unit asks whether the codec degrades *near* a
+  border; it does not. A seam is a discontinuity *across* the join between two units
+  coded without knowledge of each other — a derivative artifact — and per-unit PSNR is
+  blind to it by construction. HEVC deblocks and applies SAO within a frame, but nothing
+  filters across clips.
+
+  Measured with the blockiness index of §1.3 (`bench/seam_test.py`), tiling 512³ into
+  128³ units:
+
+  | config | ratio | PSNR | seam excess over original |
+  |---|---|---|---|
+  | replicated pad | 31.32× | 39.80 | **+40.8%** |
+  | apron 8 | 24.33× | 39.75 | +9.0% |
+  | apron 16 | 20.74× | 39.77 | +11.8% |
+
+  At qp30 plain padding reaches +62.7%. An 8-voxel apron removes about 78% of the excess
+  and costs 20–22% of ratio; 16 is no better than 8, so 8 is the size to use.
 - **Access within a clip is still sequential.** Reaching slice 400 means decoding 400
   frames regardless of how short the clip is, whereas a gpudct brick is one dispatch and
   `decode_chunk` reaches 1/P of a brick.
 - **Decode throughput**, 2.4× as above.
+
+**Seams, and why the comparison changes once both codecs are tiled.** gpudct's own
+blocking is *worse* than HEVC's when untreated — +69.8% seam excess at 128³ brick faces
+and +45.9% at 16³ chunk faces, at balanced/0.5 — but the deblocking filter is decode-side
+and costs no bits at all, where HEVC's apron costs 20–22% of bitrate:
+
+| config | ratio | PSNR | seam excess |
+|---|---|---|---|
+| gpudct, no deblock | 37.88× | 40.25 | +69.8% |
+| **gpudct `--deblock`** | **37.88×** | **40.38** | **−39.9%** |
+| HEVC, replicated pad | 31.32× | 39.80 | +40.8% |
+| HEVC, apron 8 | 24.33× | 39.75 | +9.0% |
+
+The tie reported against a single undivided 512³ clip is therefore not a usable
+comparison: that configuration has no random access. Tiled into units and paying for
+seam-free joins, at the operating points in use:
+
+| target ratio | gpudct `--deblock` | HEVC + apron |
+|---|---|---|
+| 25× | ~42.7 dB | ~39.7 dB |
+| 50× | ~39.0 dB | ~36.4 dB |
+
+About 3 dB in our favour, on top of 2.4× decode throughput.
+
+Two consequences for this codec, neither yet acted on. `--deblock` is **off by default**
+while improving PSNR, removing seams, and costing nothing, which makes the default wrong
+for every use except bit-exactness testing. And the filter over-corrects: blockiness
+lands at 0.59–0.66 where 1.0 is seamless, so it smooths chunk faces *more* than the
+interior and is likely destroying real signal there — exactly the failure that matters
+for ink detection. Reducing the filter strength is an unexploited improvement.
+
 
 **Would a 256³ brick be better?** Measured, and no. Rebuilding with `kBrickChunks = 16`
 and encoding the same volume gives identical PSNR at every rate point and a ratio gain of
