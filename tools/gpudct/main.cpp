@@ -45,6 +45,8 @@ compression options:
   --deadzone D     dead-zone width as a fraction of a step (default 0.34)
   --qshape B       radial exponent of the quant matrix (default 2.0)
   --qamp A         radial amplitude of the quant matrix (default per profile)
+  --max-abs T      hard bound on absolute error, in input units. On an integer
+                   dtype, 0.5 is lossless: half a step forces exact rounding.
   --deblock        apply the chunk-boundary deblocking filter on decode
   --reps N         bench: repeat each point N times and keep the best
 
@@ -138,6 +140,10 @@ bool parse(int argc, char** argv, Args& a) {
       const char* v = next("--qshape");
       if (!v) return false;
       a.qshape = std::strtof(v, nullptr);
+    } else if (s == "--max-abs") {
+      const char* v = next("--max-abs");
+      if (!v) return false;
+      a.enc.bounds.max_abs = std::strtof(v, nullptr);
     } else if (s == "--deblock") {
       a.deblock = true;
     } else if (s.rfind("--", 0) == 0) {

@@ -152,26 +152,73 @@ The single number hides a crossover, which is the more useful result — HEVC wi
 So on ratio alone, hardware HEVC is a genuine peer and beats us at viewing quality.
 What gpudct wins on is everything else:
 
-**Speed.** Decode, device-resident in both cases (NVDEC via `-hwaccel cuda`, gpudct via
-`DeviceVolume`, neither copying back):
+**Speed.** Both sides must be measured *saturated*, which is the trap here: a single
+ffmpeg process uses one of the card's engines and is additionally limited by ffmpeg's
+per-frame CPU work, so it understates the hardware badly. Two independent signatures show
+this. Decode throughput scales with frame *area* while frames/second stays pinned near
+3000–5500 (0.24 GB/s at 256², 1.46 at 512², 3.14 at 1024²) — a fixed per-frame cost, not
+a pixel rate. And running N clips concurrently keeps climbing to N≈4:
 
-| | latency | rate |
+| N concurrent | NVDEC 1024³ | NVENC 512³ |
 |---|---|---|
-| gpudct, 32×128³ bricks | 6.5 ms | **10.4 GB/s** |
-| gpudct, 1×128³ brick | 5.5 ms | 381 MB/s |
-| NVDEC HEVC, 1×512³ | 92–171 ms | 0.79–1.46 GB/s |
-| NVDEC HEVC, 1×256³ | 48–55 ms | 0.24–0.35 GB/s |
+| 1 | 1.93 GB/s | 0.41 GB/s |
+| 2 | 3.43 | 0.75 |
+| 4 | 4.11 | 0.90 |
+| 8 | **4.31** | **0.90** |
 
-Encode is the same story: gpudct 608 MB/s against NVENC's 170 MB/s at `p7` and 304 MB/s
-at `p1` — the ASIC is *slower* than our kernels here, because these frames are small and
-NVENC's throughput is dominated by per-frame fixed cost rather than pixel count.
+Saturation at ~2.2× single-stream, plateauing at N=4, is consistent with 2 NVENC and 2
+NVDEC engines on this part. N=8 raised no session errors, so the driver's encode-session
+cap is not what binds. Against those ceilings, device-resident in both cases (NVDEC via
+`-hwaccel cuda`, gpudct via `DeviceVolume`, neither copying back):
 
-**Granularity, which is the real disqualifier.** NVENC will not encode a frame below
-129×129 (145 for H.264) and **NVDEC will not decode one below 144×144**. A 128³ brick
-cannot pass through the hardware video path at all without being padded 1.27× in pixels.
-Random access is also inherently unavailable: reaching slice 400 of a clip means decoding
-400 frames, whereas a gpudct brick is independently decodable by construction and
-`decode_chunk` reaches 1/P of a brick.
+| | rate | vs saturated ASIC |
+|---|---|---|
+| **decode** — gpudct 32×128³ bricks, 6.5 ms | 10.4 GB/s | **2.4× faster** than NVDEC's 4.31 |
+| **encode** — gpudct | 608 MB/s | **1.5× slower** than NVENC's 0.90 GB/s |
+
+So the hardware wins on encode and loses on decode. An earlier revision of this section
+claimed the opposite for encode, by comparing gpudct's whole-GPU throughput against a
+single NVENC session; the fixed-function encoder is genuinely faster than our kernels
+once both engines are in use. Decode latency for a single 128³ brick is 5.5 ms, which
+NVDEC cannot match at any batch size because it cannot decode a 128³ brick at all — see
+below.
+
+**Granularity costs a video codec far less than expected**, which is worth recording
+because it contradicts the premise this comparison started from — that video codecs earn
+their ratio from long GOPs, so their advantage comes from giving up random access.
+Varying one axis at a time on the same voxels:
+
+| lever | qp24 | qp36 |
+|---|---|---|
+| frame size, 256² → 1024² (16× the pixels) | +1.9% | +7.6% |
+| clip length, 32 → 1024 frames (32× longer) | +5.6% | +16.0% |
+
+Both are weak, and length saturates past ~128 frames. A 32-frame clip of 256² frames — a
+~2 MB independently-decodable unit, the size of one gpudct brick — reaches 20.83× at
+38.0 dB, against our balanced profile's 20.88× at 38.4 dB. **At matched random-access
+granularity the two are even on ratio.** The 64× granularity sacrifice buys HEVC 3–10%,
+not the large win the framing assumed.
+
+So the differentiators are not ratio-at-granularity. They are:
+
+- **NVENC will not encode a frame below 129×129** (145 for H.264) and **NVDEC will not
+  decode one below 144×144**. A 128³ brick cannot pass through the hardware video path
+  at all without a 1.27× pixel pad — the hardware simply does not operate at this size.
+- **Access within a clip is still sequential.** Reaching slice 400 means decoding 400
+  frames regardless of how short the clip is, whereas a gpudct brick is one dispatch and
+  `decode_chunk` reaches 1/P of a brick.
+- **Decode throughput**, 2.4× as above.
+
+**Would a 256³ brick be better?** Measured, and no. Rebuilding with `kBrickChunks = 16`
+and encoding the same volume gives identical PSNR at every rate point and a ratio gain of
++6.6% at q=0.125, +1.9% at q=1.0, +1.1% at q=4.0 — the gain is per-brick entropy tables
+amortized over 8× more chunks, so it is largest where tables are the biggest share. That
+~2% at working quality costs 8× coarser random access (2 MB → 16 MB per brick), breaks
+the brick = one Vesuvius Zarr chunk mapping so every access becomes an 8× fetch
+amplification, and does not survive on the CUDA backend as a constant change (every rate
+point failed on device while the CPU path was fine). Note the asymmetry: 256³ helps HEVC
+*more* than it helps us (+2.8% at qp24), because their mechanism is GOP length and ours
+is table amortization. Neither is worth the granularity.
 
 Caveats, so these numbers are not over-read: the harness drives ffmpeg, whose per-frame
 CPU work means the NVDEC figures are a **floor on the silicon, not its ceiling**; encode

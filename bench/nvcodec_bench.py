@@ -7,10 +7,12 @@ a video -- z becomes time -- how much ratio, quality and speed does that buy,
 and what does a codec built for 3D data actually add?
 
 Brick edge length is swept, and the sweep *is* the experiment. A brick is the
-random-access unit: at edge `b`, seeing one voxel costs decoding b^3. Video
-codecs earn their ratio from long GOPs, so their numbers improve steadily as `b`
-grows and random access is given away. gpudct's brick is 128^3 and independently
-decodable by construction, so its curve is flat along that axis.
+random-access unit: at edge `b`, seeing one voxel costs decoding b^3. The premise
+going in was that video codecs earn their ratio from long GOPs, so their numbers
+would improve steadily as `b` grows and random access is given away. Measured,
+that is mostly false: 16x the frame area is worth +1.9% at qp24 and 32x the clip
+length +5.6%, and length saturates past ~128 frames. At matched granularity a
+video codec and gpudct are even on ratio -- see docs/QUALITY.md section 2.1.
 
 Grayscale handling: NVENC has no useful monochrome mode. `-pix_fmt gray` is
 accepted and decodes, but --sweep measured it at +85% bitrate for equal PSNR, so
