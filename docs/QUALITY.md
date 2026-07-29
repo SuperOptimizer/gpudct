@@ -284,6 +284,20 @@ results worth keeping:
   half of them (`-b_ref_mode middle`) rather than all is worth −12.8%.
 - **`-tune uhq` is incompatible with B-frames** on this driver at every resolution up to
   512×512, and B-frames are worth far more, so `-tune hq` is correct.
+- **Per-frame-type QP offsets** are worth −1.83% at ±4 (`-init_qpI qp-4 -init_qpB qp+4`).
+  Plain `constqp` quantizes every frame in the B pyramid identically, which is not what a
+  hierarchical coder wants. ±2 gives −1.57%, ±6 only −0.48%, ±8 is a net loss.
+
+**Tuning is exhausted.** Across three sweep rounds and ~35 configurations, only two
+settings are worth anything: `-b_ref_mode middle` (−12.8%) and QP offsets (−1.83%).
+Everything else lands inside ±1%: VBR constant-quality −0.29%, `-multipass fullres`
+−0.06% (−0.73% combined with VBR), larger `-dpb_size` a small *loss* (+0.21% at 8, +0.65%
+at 16), and disabling SEI/metadata exactly zero. Container choice is a real but tiny
+effect — mp4 costs a flat ~7 KB against a raw elementary stream, which is 0.22% at qp24
+and 6.1% at qp48, so it is under 0.5% anywhere in the 10–100× band and only matters at
+extreme ratios. HEVC's numbers here therefore reflect a genuinely tuned encoder, and the
+~1.8% still available to it would move the crossover against us by a fraction of a dB
+without changing any conclusion.
 
 One measurement bug is recorded here because it nearly became a published conclusion:
 `av1_nvenc` does not preserve the full-range flag that HEVC does, so the decoder expands

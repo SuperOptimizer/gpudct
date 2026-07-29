@@ -102,6 +102,7 @@ TUNED = {
     # bf>3 the adaptive B decision overrides the setting anyway.
     "bf": 3,
     "b_ref_mode": "middle",
+    "qp_offset": 4,
     "extra": [],
 }
 
@@ -119,6 +120,15 @@ def encode_args(codec, qp, gop, cfg, lossless=False):
         a += ["-tune", "lossless"]
     else:
         a += ["-tune", cfg["tune"], "-rc", "constqp", "-qp", str(qp)]
+        # Per-frame-type QP offsets. Under plain constqp every frame in the B
+        # pyramid is quantized identically, which is not what a hierarchical
+        # coder wants: intra frames are referenced by everything downstream and
+        # deserve more bits, disposable B frames fewer. +/-4 measured -1.83%;
+        # +/-2 gives -1.57%, +/-6 only -0.48% and +/-8 is a net loss.
+        if cfg.get("qp_offset"):
+            d = cfg["qp_offset"]
+            a += ["-init_qpI", str(max(0, qp - d)), "-init_qpP", str(qp),
+                  "-init_qpB", str(min(51, qp + d))]
     a += [
         # Adaptive quantization moves bits to where a human eye looks. The
         # metric here is PSNR and there is no viewer, so AQ is a pure loss.
@@ -323,6 +333,22 @@ def fmt_row(m):
 # Candidate settings, scored by BD-rate against the baseline over a QP set.
 # Anything the driver rejects is reported as such rather than silently skipped.
 def candidates(rnd):
+    if rnd == 3:
+        # Round 3: levers rounds 1-2 never touched. The interesting ones are
+        # per-frame-type QP offsets -- with -rc constqp every frame in the B
+        # pyramid gets the same QP, whereas a hierarchical coder normally
+        # spends more on frames that will be referenced -- and whether VBR's
+        # constant-quality mode allocates across frames better than fixed QP.
+        return [
+            ("baseline constqp", cfg_with()),
+            ("qpI-3 qpB+3", cfg_with(extra=["-init_qpI", "-1"])),  # placeholder, set per-qp below
+            ("dpb_size 8", cfg_with(extra=["-dpb_size", "8"])),
+            ("dpb_size 16", cfg_with(extra=["-dpb_size", "16"])),
+            ("no SEI/metadata", cfg_with(extra=["-extra_sei", "0", "-a53cc", "0",
+                                                "-s12m_tc", "0", "-aud", "0"])),
+            ("multipass fullres", cfg_with(extra=["-multipass", "fullres"])),
+            ("multipass qres", cfg_with(extra=["-multipass", "qres"])),
+        ]
     if rnd == 2:
         # Round 2: combinations of what round 1 liked. Round 1's verdicts:
         #   b_ref middle       -12.8%   the single biggest win
