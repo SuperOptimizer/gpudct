@@ -6,6 +6,8 @@
 // speed lives.
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <atomic>
 #include <cmath>
 #include <cstring>
@@ -274,8 +276,8 @@ void parallel_for(std::uint64_t n, int threads, const std::function<void(std::ui
 // either side, so no two planes on the same axis interact: each axis pass is
 // embarrassingly parallel and order-independent within itself. The axes are
 // applied in a fixed order, and that order is part of the reconstruction.
-void deblock_volume(void* data, Dims dims, DType t, float scale, float offset,
-                    const DeblockThresholds& th, int threads) {
+void deblock_volume(void* data, Dims dims, DType t, float scale, float offset, float model_rms,
+                    float strength, int threads) {
   const float inv_scale = 1.0f / scale;
   auto get = [&](std::uint32_t x, std::uint32_t y, std::uint32_t z) {
     return load_voxel(data, t, (static_cast<std::size_t>(z) * dims.y + y) * dims.x + x) * scale +
@@ -287,8 +289,51 @@ void deblock_volume(void* data, Dims dims, DType t, float scale, float offset,
   };
 
   const std::uint32_t lim[3] = {dims.x, dims.y, dims.z};
+
+  // Mean |first difference| along `ax`, over interior steps only -- steps that
+  // straddle a chunk face are the thing being measured against and would bias
+  // the threshold toward whatever artifact is already there. Scroll data is
+  // anisotropic (roughly 1.6:1 between z and the in-plane axes), so this is per
+  // axis rather than one number for the volume. Sampled on a stride-4 lattice
+  // of lines: it is a summary statistic over millions of steps and does not
+  // need every one of them.
+  auto activity = [&](int ax) {
+    const int a1 = (ax + 1) % 3, a2 = (ax + 2) % 3;
+    const std::uint32_t stride = 4;
+    double acc = 0.0;
+    std::uint64_t n = 0;
+    for (std::uint32_t u = 0; u < lim[a1]; u += stride)
+      for (std::uint32_t v = 0; v < lim[a2]; v += stride) {
+        std::uint32_t c[3] = {0, 0, 0};
+        c[a1] = u;
+        c[a2] = v;
+        auto at = [&](std::uint32_t k) {
+          std::uint32_t q[3] = {c[0], c[1], c[2]};
+          q[ax] = k;
+          return get(q[0], q[1], q[2]);
+        };
+        float prev = at(0);
+        for (std::uint32_t k = 1; k < lim[ax]; ++k) {
+          const float cur = at(k);
+          if ((k - 1) % kChunkDim != kChunkDim - 1) {
+            acc += std::fabs(cur - prev);
+            ++n;
+          }
+          prev = cur;
+        }
+      }
+    // A perfectly flat volume has no interior activity and nothing to protect;
+    // fall back to the quantizer's own estimate rather than to zero.
+    return n ? static_cast<float>(acc / static_cast<double>(n)) : model_rms * 3.0f;
+  };
+
   for (int ax = 0; ax < 3; ++ax) {
     if (lim[ax] < 4) continue;
+    const float act = activity(ax);
+    static const bool deblock_debug = std::getenv("GPUDCT_DEBLOCK_DEBUG") != nullptr;
+    if (deblock_debug)
+      std::fprintf(stderr, "[deblock] ax=%d model_rms=%.3f activity=%.3f\n", ax, model_rms, act);
+    const DeblockThresholds th = deblock_thresholds(model_rms, act, strength);
     // Every chunk boundary along this axis.
     const std::uint32_t planes = (lim[ax] - 1) / kChunkDim;
     if (planes == 0) continue;
@@ -1301,7 +1346,7 @@ Status decode_into(std::span<const std::uint8_t> archive, const DecodeOptions& o
       if (opts.deblock && opts.deblock_strength > 0.0f &&
           (h.flags & detail::kFlagCorrections) == 0)
         deblock_volume(out.data(), h.dims, h.dtype, h.data_scale, h.data_offset,
-                       DeblockThresholds::from(qm, opts.deblock_strength), opts.threads);
+                       expected_voxel_rms(qm), opts.deblock_strength, opts.threads);
       return Status::ok;
     }
     if (cs != Status::backend_unavailable) return cs;
@@ -1366,7 +1411,7 @@ Status decode_into(std::span<const std::uint8_t> archive, const DecodeOptions& o
   const bool has_corrections = (h.flags & detail::kFlagCorrections) != 0;
   if (opts.deblock && opts.deblock_strength > 0.0f && !has_corrections)
     deblock_volume(out.data(), h.dims, h.dtype, h.data_scale, h.data_offset,
-                   DeblockThresholds::from(qm, opts.deblock_strength), opts.threads);
+                   expected_voxel_rms(qm), opts.deblock_strength, opts.threads);
   return Status::ok;
 }
 

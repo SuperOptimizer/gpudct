@@ -41,11 +41,47 @@ struct DeblockThresholds {
   float beta;   // largest neighbourhood variation still considered flat
   float clip;   // largest correction applied to any one voxel
 
-  static DeblockThresholds from(const QuantMatrix& qm, float strength) {
-    const float rms = expected_voxel_rms(qm) * std::max(0.0f, strength);
+  static DeblockThresholds from_rms(float rms) noexcept {
     return {3.0f * rms, 2.0f * rms, rms};
   }
 };
+
+// Reconciles the quantizer's predicted error with what the data can actually
+// support.
+//
+// expected_voxel_rms is scale-free: it grows linearly in the quantizer step
+// forever. Real reconstruction error does not, because it cannot exceed the
+// signal's own local variation -- once the step is coarse enough to zero a
+// coefficient, the error is that coefficient's magnitude, not the step. So the
+// model overpredicts at coarse quantizers, exactly where the filter is already
+// most aggressive, and the result is a filter that smooths chunk faces flatter
+// than the volume's interior. Measured, the shipped strength overshot at every
+// rate and cost PSNR outright at quality 1.0 (docs/QUALITY.md 2.2).
+//
+// `activity` is the mean absolute first difference along the filtered axis,
+// taken over interior steps of the decoded volume -- the same quantity the
+// blockiness index divides by. It is per axis because scroll data is not
+// isotropic; on real full-resolution PHerc it differs by 1.8x between axes.
+//
+// The two limits are combined as a reciprocal sum rather than a minimum. They
+// are independent bounds on the same error, so the effective one is softly the
+// smaller: a hard min switches abruptly at the crossover and, measured, cut the
+// filter to almost nothing across the whole useful rate range. The reciprocal
+// form reduces to model_rms when the quantizer is fine and to kActivityGain *
+// activity when it is coarse, with no discontinuity between.
+//
+// kActivityGain was fitted by back-solving the measured seam-optimal thresholds
+// at quality 0.25, 0.5 and 1.0, where model_rms spans 19.5 to 4.9. It comes out
+// at 1.74 / 1.64 / 1.78 -- constant to within the measurement, which is the
+// evidence that this is the right functional form and not a curve fit.
+inline constexpr float kActivityGain = 1.7f;
+
+[[nodiscard]] inline DeblockThresholds deblock_thresholds(float model_rms, float activity,
+                                                          float strength) noexcept {
+  const float a = kActivityGain * std::max(activity, 1e-6f);
+  const float rms = (model_rms * a / (model_rms + a)) * std::max(0.0f, strength);
+  return DeblockThresholds::from_rms(rms);
+}
 
 // Filters one face. p1,p0 are the two voxels before the boundary and q0,q1 the
 // two after; p0/q0 are adjusted in place.
