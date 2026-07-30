@@ -1,0 +1,137 @@
+name: ci
+
+# The CUDA backend is deliberately not built here: GitHub's hosted runners have
+# no NVIDIA GPU, and a build-only CUDA job would compile kernels nothing ever
+# runs. Cross-backend equivalence (docs/QUALITY.md 4.2) is the load-bearing test
+# for that path and it needs a device, so it stays a local gate for now.
+#
+# What this does catch is the failure that motivated it: a backend that stops
+# compiling without anyone noticing.
+
+on:
+  push:
+    branches: [main, codec]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-clang-release
+            os: ubuntu-24.04
+            preset_cc: clang
+            build_type: Release
+          - name: linux-clang-debug
+            os: ubuntu-24.04
+            preset_cc: clang
+            build_type: Debug
+          - name: linux-gcc-release
+            os: ubuntu-24.04
+            preset_cc: gcc
+            build_type: Release
+          - name: windows-msvc-release
+            os: windows-2022
+            preset_cc: msvc
+            build_type: Release
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install clang
+        if: matrix.preset_cc == 'clang'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-18
+          echo "CC=clang-18"  >> "$GITHUB_ENV"
+          echo "CXX=clang++-18" >> "$GITHUB_ENV"
+
+      - name: Select gcc
+        if: matrix.preset_cc == 'gcc'
+        run: |
+          echo "CC=gcc-13"  >> "$GITHUB_ENV"
+          echo "CXX=g++-13" >> "$GITHUB_ENV"
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: matrix.preset_cc == 'msvc'
+
+      # Warnings are errors in CI only. Locally an in-progress edit should not
+      # be blocked by an unused variable; on a shared branch it should.
+      - name: Configure
+        run: >
+          cmake -B build -S .
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DGPUDCT_WERROR=ON
+          -DGPUDCT_ENABLE_CUDA=OFF
+
+      - name: Build
+        run: cmake --build build --config ${{ matrix.build_type }} --parallel
+
+      - name: Test
+        working-directory: build
+        run: ctest --build-config ${{ matrix.build_type }} --output-on-failure
+
+  sanitizers:
+    name: sanitizers (${{ matrix.san }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        san: [address-undefined, thread]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install clang
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-18
+          echo "CC=clang-18"  >> "$GITHUB_ENV"
+          echo "CXX=clang++-18" >> "$GITHUB_ENV"
+
+      - name: Set sanitizer flags
+        run: |
+          if [ "${{ matrix.san }}" = "thread" ]; then
+            echo "SAN_FLAGS=-fsanitize=thread -g" >> "$GITHUB_ENV"
+          else
+            echo "SAN_FLAGS=-fsanitize=address,undefined -fno-sanitize-recover=all -g" >> "$GITHUB_ENV"
+          fi
+
+      # RelWithDebInfo, not Debug: the codec is slow enough under a sanitizer
+      # that an unoptimized build turns the round-trip tests into a timeout.
+      - name: Configure
+        run: >
+          cmake -B build -S .
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DGPUDCT_ENABLE_CUDA=OFF
+          -DCMAKE_CXX_FLAGS="$SAN_FLAGS"
+          -DCMAKE_EXE_LINKER_FLAGS="$SAN_FLAGS"
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        working-directory: build
+        run: ctest --output-on-failure --timeout 1200
+
+  format:
+    name: clang-format
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check formatting
+        run: |
+          if [ ! -f .clang-format ]; then
+            echo "no .clang-format in the tree; nothing to check"
+            exit 0
+          fi
+          sudo apt-get update && sudo apt-get install -y clang-format-18
+          files=$(git ls-files '*.cpp' '*.hpp' '*.cu' '*.cuh')
+          clang-format-18 --dry-run --Werror $files

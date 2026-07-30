@@ -487,11 +487,45 @@ assert |size(enc_X)  − size(enc_scalar)| / size < 1e-3
 assert fraction of differing quantized levels < 1e-5
 ```
 
-Golden-file tests (§4.4) pin the **scalar CPU encoder** specifically, since it is the
-only one defined to be reproducible byte-for-byte across machines (built with
-`-ffp-contract=off`, no fast-math).
-
 Runs on every PR (CPU) and nightly (GPU). Any Tier-1 divergence is a P0.
+
+### 4.2b Floating-point policy, and the one place it costs something
+
+The build enables fast floating point: FMA contraction and reassociation. Measured on
+real full-resolution scroll, that is worth **+25% CPU decode** (1724 → 2159 MB/s) and
+**+2.6% encode** at *identical* ratio — 21.84× and 0.3663 bpv either way. The cost is
+that no backend is byte-reproducible any more, which is why §4.2's tiers and the
+golden tests (§4.4) assert tolerances rather than hashes. Divergence between the scalar
+and SIMD backends measures at most **1 LSB on 0.27% of voxels**, with archive sizes
+identical to the byte.
+
+`-fno-finite-math-only` is kept. The `f32` dtype means caller data can legitimately
+contain NaN or Inf, and assuming their absence is not a rounding difference — it turns a
+representable input into undefined behaviour.
+
+**The exception is the bounded-error modes**, and it is not cosmetic. `--max-abs` and its
+relatives are a *hard* guarantee, and the correction layer establishes it by computing
+residuals against the decoder's own reconstruction. That only works if encoder and
+decoder reconstruct identically. Within one build they do, and the bound holds exactly:
+
+| bound | max error, same build | max error, encode strict / decode fast |
+|---|---|---|
+| 0.5 (lossless) | 0 | **1** (84 voxels of 134M) |
+| 2 | 2 | **3** (9 voxels) |
+
+So across builds the declared bound is exceeded, rarely and by ~1 LSB, but exceeded. A
+bound that is occasionally wrong is not a bound. Two honest positions, and the choice is
+per workflow rather than global:
+
+- **Lossy archives** — use the default. The guarantee that matters is statistical and
+  fast math does not move it.
+- **Bounded-error or lossless archives that outlive the build that wrote them** — build
+  with `-DGPUDCT_STRICT_FP=ON`. It restores exact reproducibility, and the 25% decode is
+  the price of a guarantee that is actually a guarantee.
+
+The conformance corpus (§4.4) is what would catch a regression here, and it is now
+required rather than optional: with a non-reproducible encoder, "old archives still
+decode correctly" can only be tested against archives that are genuinely old.
 
 ### 4.3 Property / fuzz
 

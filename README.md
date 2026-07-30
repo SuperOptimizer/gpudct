@@ -79,9 +79,11 @@ on an RTX 5080 (sm_120, CUDA 13.3): agreement is byte-identical on most volumes
 and within 1 LSB on real scroll data, with under 1e-5 of voxels differing.
 
 The GPU and CPU backends are at full feature parity, per-brick entropy tables
-included. Under plain quantization the two encoders produce byte-identical
-archives; under RDO they produce archives of identical size that decode to the
-same voxels, and the difference is worth understanding -- see below.
+included. The build enables fast floating point, so backends agree within a
+tolerance rather than byte for byte: measured, at most 1 LSB on a fraction of a
+percent of voxels, with archive sizes identical. That buys +25% CPU decode at
+identical ratio. Bounded-error and lossless archives that must outlive the build
+that wrote them want `-DGPUDCT_STRICT_FP=ON` -- see docs/QUALITY.md 4.2b.
 
 Not done: DC-plane prediction (measured worthless -- DC is 0.1-0.5% of coded
 bits), Zarr integration, comparisons against ZFP / SZ3, and CI. A progressive

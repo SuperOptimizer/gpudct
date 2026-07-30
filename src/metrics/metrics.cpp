@@ -596,12 +596,16 @@ std::vector<BrickScore> worst_bricks(const float* orig, const float* dec, Dims d
 std::string format_report(const Metrics& m, bool verbose) {
   std::string s;
   char buf[512];
+  // The no-argument overload is separate on purpose: passing a runtime `fmt`
+  // to snprintf with no varargs is what -Wformat-security flags, and a section
+  // heading is a plain string with nothing to format.
+  auto head = [&](const char* text) { s += text; };
   auto line = [&](const char* fmt, auto... args) {
     std::snprintf(buf, sizeof(buf), fmt, args...);
     s += buf;
   };
 
-  line("error\n");
+  head("error\n");
   line("  mae                %12.6f\n", m.mae);
   line("  rmse               %12.6f\n", m.rmse);
   line("  bias               %12.6f\n", m.bias);
@@ -609,11 +613,11 @@ std::string format_report(const Metrics& m, bool verbose) {
        m.abs_err.p95);
   line("  p99 / p99.9        %12.4f %12.4f\n", m.abs_err.p99, m.abs_err.p999);
   line("  p99.99 / max       %12.4f %12.4f\n", m.abs_err.p9999, m.abs_err.max);
-  line("fidelity\n");
+  head("fidelity\n");
   line("  psnr (dtype range) %12.3f dB\n", m.psnr_dtype);
   line("  psnr (data range)  %12.3f dB\n", m.psnr_range);
   line("  ssim 3d            %12.6f  (p01 %.6f)\n", m.ssim, m.ssim_p01);
-  line("structure\n");
+  head("structure\n");
   line("  gradient mae/p99   %12.6f %12.6f\n", m.gradient_mae, m.gradient_p99);
   line("  blockiness         %12.4f  (1.0 = no seams)\n", m.blockiness);
   line("  laplacian ratio    %12.4f  (1.0 = detail preserved)\n", m.laplacian_ratio);
@@ -624,20 +628,20 @@ std::string format_report(const Metrics& m, bool verbose) {
   line("  hist emd           %12.6f\n", m.hist_emd);
 
   if (verbose) {
-    line("anisotropy\n");
+    head("anisotropy\n");
     line("  worst slice mae    x %.5f  y %.5f  z %.5f\n", m.worst_slice_mae[0],
          m.worst_slice_mae[1], m.worst_slice_mae[2]);
     line("  axis gradient mae  x %.5f  y %.5f  z %.5f\n", m.axis_gradient_mae[0],
          m.axis_gradient_mae[1], m.axis_gradient_mae[2]);
     line("  error autocorr     x %+.4f  y %+.4f  z %+.4f  (0 = white)\n",
          m.error_autocorr[0], m.error_autocorr[1], m.error_autocorr[2]);
-    line("conditioned\n");
+    head("conditioned\n");
     line("  mae by intensity   %.5f %.5f %.5f %.5f  (low -> high)\n", m.mae_by_intensity[0],
          m.mae_by_intensity[1], m.mae_by_intensity[2], m.mae_by_intensity[3]);
     line("  mae, top decile of gradient %.5f\n", m.mae_high_gradient);
   }
   if (m.ratio > 0) {
-    line("rate\n");
+    head("rate\n");
     line("  ratio              %12.2fx\n", m.ratio);
     line("  bits per voxel     %12.4f\n", m.bits_per_voxel);
   }
