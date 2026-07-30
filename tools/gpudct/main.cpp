@@ -192,9 +192,9 @@ void print_size(const char* label, std::size_t bytes) {
 int cmd_compress(const Args& a) {
   if (a.in.empty() || a.out.empty() || !a.have_dims || !a.have_dtype) return usage();
 
-  std::vector<std::uint8_t> raw;
+  MappedFile raw;
   std::string err;
-  if (!read_file(a.in, raw, err)) {
+  if (!raw.open(a.in, err)) {
     std::fprintf(stderr, "error: %s\n", err.c_str());
     return 1;
   }
@@ -253,32 +253,37 @@ int cmd_decompress(const Args& a) {
     std::fprintf(stderr, "error: %s\n", std::string(status_message(ps)).c_str());
     return 1;
   }
-  // Deliberately uninitialized: `new T[n]` default-initializes, which for a
-  // trivial type means no work at all. Every voxel is written by the decoder, and
-  // zeroing a gigabyte first costs more than the decode does.
+  // Decode straight into the mapped output file. Previously this allocated an
+  // uninitialized heap block, decoded into it, copied the whole thing into a
+  // vector, and handed that to write_file -- three full-volume buffers live at
+  // once for a job that needs none of them. The mapping is the decode target and
+  // the file at the same time.
   const std::size_t nbytes = probe.dims.voxels() * dtype_size(probe.dtype);
-  std::unique_ptr<std::uint8_t[]> buf(new std::uint8_t[nbytes]);
+  MappedOutput out;
+  if (!out.create(a.out, nbytes, err)) {
+    std::fprintf(stderr, "error: %s\n", err.c_str());
+    return 1;
+  }
 
   const double warm = warm_up_backend(a.backend);
   const auto t0 = std::chrono::steady_clock::now();
   VolumeInfo info;
-  const Status s = decode_into(archive, opts, {buf.get(), nbytes}, info, a.backend);
+  const Status s = decode_into(archive, opts, {out.data(), nbytes}, info, a.backend);
   const double dt = seconds_since(t0);
   if (s != Status::ok) {
     std::fprintf(stderr, "error: decode failed: %s\n", std::string(status_message(s)).c_str());
     return 1;
   }
-  const std::vector<std::uint8_t> out(buf.get(), buf.get() + nbytes);
-  if (!write_file(a.out, out, err)) {
+  if (!out.close(err)) {
     std::fprintf(stderr, "error: %s\n", err.c_str());
     return 1;
   }
 
   std::printf("%-14s %ux%ux%u %s\n", "volume", info.dims.x, info.dims.y, info.dims.z,
               std::string(dtype_name(info.dtype)).c_str());
-  print_size("output", out.size());
+  print_size("output", nbytes);
   std::printf("%-14s %12.3f s (%.1f MB/s)\n", "decode", dt,
-              static_cast<double>(out.size()) / dt / 1e6);
+              static_cast<double>(nbytes) / dt / 1e6);
   return 0;
 }
 
@@ -315,9 +320,9 @@ int cmd_inspect(const Args& a) {
 
 int cmd_bench(const Args& a) {
   if (a.in.empty() || !a.have_dims || !a.have_dtype) return usage();
-  std::vector<std::uint8_t> raw;
+  MappedFile raw;
   std::string err;
-  if (!read_file(a.in, raw, err)) {
+  if (!raw.open(a.in, err)) {
     std::fprintf(stderr, "error: %s\n", err.c_str());
     return 1;
   }
@@ -379,17 +384,17 @@ int cmd_bench(const Args& a) {
 }
 
 // Converts a typed buffer to f32 for the metrics code.
-std::vector<float> to_float(const std::vector<std::uint8_t>& buf, DType t, std::size_t n) {
+std::vector<float> to_float(const std::uint8_t* buf, DType t, std::size_t n) {
   std::vector<float> out(n);
   for (std::size_t i = 0; i < n; ++i) {
     switch (t) {
       case DType::u8:  out[i] = buf[i]; break;
-      case DType::s8:  out[i] = reinterpret_cast<const std::int8_t*>(buf.data())[i]; break;
-      case DType::u16: out[i] = reinterpret_cast<const std::uint16_t*>(buf.data())[i]; break;
-      case DType::s16: out[i] = reinterpret_cast<const std::int16_t*>(buf.data())[i]; break;
-      case DType::u32: out[i] = static_cast<float>(reinterpret_cast<const std::uint32_t*>(buf.data())[i]); break;
-      case DType::s32: out[i] = static_cast<float>(reinterpret_cast<const std::int32_t*>(buf.data())[i]); break;
-      case DType::f32: out[i] = reinterpret_cast<const float*>(buf.data())[i]; break;
+      case DType::s8:  out[i] = reinterpret_cast<const std::int8_t*>(buf)[i]; break;
+      case DType::u16: out[i] = reinterpret_cast<const std::uint16_t*>(buf)[i]; break;
+      case DType::s16: out[i] = reinterpret_cast<const std::int16_t*>(buf)[i]; break;
+      case DType::u32: out[i] = static_cast<float>(reinterpret_cast<const std::uint32_t*>(buf)[i]); break;
+      case DType::s32: out[i] = static_cast<float>(reinterpret_cast<const std::int32_t*>(buf)[i]); break;
+      case DType::f32: out[i] = reinterpret_cast<const float*>(buf)[i]; break;
     }
   }
   return out;
@@ -400,9 +405,9 @@ std::vector<float> to_float(const std::vector<std::uint8_t>& buf, DType t, std::
 // ratio number on its own never does.
 int cmd_eval(const Args& a) {
   if (a.in.empty() || !a.have_dims || !a.have_dtype) return usage();
-  std::vector<std::uint8_t> raw;
+  MappedFile raw;
   std::string err;
-  if (!read_file(a.in, raw, err)) {
+  if (!raw.open(a.in, err)) {
     std::fprintf(stderr, "error: %s\n", err.c_str());
     return 1;
   }
@@ -413,7 +418,7 @@ int cmd_eval(const Args& a) {
                  std::string(dtype_name(a.dtype)).c_str(), expect);
     return 1;
   }
-  const std::vector<float> orig = to_float(raw, a.dtype, a.dims.voxels());
+  const std::vector<float> orig = to_float(raw.data(), a.dtype, a.dims.voxels());
 
   std::printf("%s  %ux%ux%u %s  (%.1f MiB)\n", a.in.c_str(), a.dims.x, a.dims.y, a.dims.z,
               std::string(dtype_name(a.dtype)).c_str(),
@@ -446,7 +451,7 @@ int cmd_eval(const Args& a) {
       VolumeInfo info;
       if (decode(archive, dopts, out, info, a.backend) != Status::ok) continue;
 
-      const std::vector<float> dec = to_float(out, a.dtype, a.dims.voxels());
+      const std::vector<float> dec = to_float(out.data(), a.dtype, a.dims.voxels());
       Metrics m = compute_metrics(orig.data(), dec.data(), a.dims, a.dtype);
       m.ratio = static_cast<double>(raw.size()) / static_cast<double>(archive.size());
       m.bits_per_voxel =
@@ -464,9 +469,9 @@ int cmd_eval(const Args& a) {
 
 int cmd_metrics(const Args& a) {
   if (a.in.empty() || a.out.empty() || !a.have_dims || !a.have_dtype) return usage();
-  std::vector<std::uint8_t> ba, bb;
+  MappedFile ba, bb;
   std::string err;
-  if (!read_file(a.in, ba, err) || !read_file(a.out, bb, err)) {
+  if (!ba.open(a.in, err) || !bb.open(a.out, err)) {
     std::fprintf(stderr, "error: %s\n", err.c_str());
     return 1;
   }
@@ -475,8 +480,8 @@ int cmd_metrics(const Args& a) {
     std::fprintf(stderr, "error: inputs must both be %zu bytes\n", expect);
     return 1;
   }
-  const std::vector<float> fa = to_float(ba, a.dtype, a.dims.voxels());
-  const std::vector<float> fb = to_float(bb, a.dtype, a.dims.voxels());
+  const std::vector<float> fa = to_float(ba.data(), a.dtype, a.dims.voxels());
+  const std::vector<float> fb = to_float(bb.data(), a.dtype, a.dims.voxels());
   const Metrics m = compute_metrics(fa.data(), fb.data(), a.dims, a.dtype);
   std::printf("%s", format_report(m, true).c_str());
 
@@ -493,9 +498,9 @@ int cmd_metrics(const Args& a) {
 // Where the coded bits go, by stage. Answers "what should I optimize next".
 int cmd_bits(const Args& a) {
   if (a.in.empty() || !a.have_dims || !a.have_dtype) return usage();
-  std::vector<std::uint8_t> raw;
+  MappedFile raw;
   std::string err;
-  if (!read_file(a.in, raw, err)) {
+  if (!raw.open(a.in, err)) {
     std::fprintf(stderr, "error: %s\n", err.c_str());
     return 1;
   }
