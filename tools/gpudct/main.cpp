@@ -48,6 +48,8 @@ compression options:
   --max-abs T      hard bound on absolute error, in input units. On an integer
                    dtype, 0.5 is lossless: half a step forces exact rounding.
   --deblock        apply the chunk-boundary deblocking filter on decode
+  --deblock-strength S   scale the filter thresholds; 1.0 is calibrated,
+                   0 disables. Implies --deblock when > 0.
   --reps N         bench: repeat each point N times and keep the best
 
 structure:
@@ -66,6 +68,7 @@ struct Args {
   EncodeOptions enc{};
   Backend backend = Backend::automatic;
   bool deblock = false;
+  float deblock_strength = 1.0f;
   float deadzone = -1.0f;  // <0 = profile default
   float qshape = -1.0f;    // <0 = profile default (radial exponent b)
   float qamp = -1.0f;      // <0 = profile default (radial amplitude a)
@@ -146,6 +149,11 @@ bool parse(int argc, char** argv, Args& a) {
       a.enc.bounds.max_abs = std::strtof(v, nullptr);
     } else if (s == "--deblock") {
       a.deblock = true;
+    } else if (s == "--deblock-strength") {
+      const char* v = next("--deblock-strength");
+      if (!v) return false;
+      a.deblock_strength = std::strtof(v, nullptr);
+      a.deblock = a.deblock_strength > 0.0f;
     } else if (s.rfind("--", 0) == 0) {
       std::fprintf(stderr, "error: unknown option %s\n", s.c_str());
       return false;
@@ -239,6 +247,7 @@ int cmd_decompress(const Args& a) {
   DecodeOptions opts;
   opts.threads = a.enc.threads;
   opts.deblock = a.deblock;
+  opts.deblock_strength = a.deblock_strength;
   VolumeInfo probe;
   if (const Status ps = inspect(archive, probe); ps != Status::ok) {
     std::fprintf(stderr, "error: %s\n", std::string(status_message(ps)).c_str());
@@ -432,6 +441,7 @@ int cmd_eval(const Args& a) {
       DecodeOptions dopts;
       dopts.threads = a.enc.threads;
       dopts.deblock = a.deblock;
+      dopts.deblock_strength = a.deblock_strength;
       std::vector<std::uint8_t> out;
       VolumeInfo info;
       if (decode(archive, dopts, out, info, a.backend) != Status::ok) continue;
