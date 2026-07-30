@@ -19,6 +19,7 @@ gpudct_test(test_deblock)
 gpudct_test(test_bounds)
 gpudct_test(test_golden)
 gpudct_test(test_conformance)
+gpudct_test(test_threading)
 gpudct_test(test_cuda)
 
 # Corpus writer. Deliberately not an add_test: see tests/make_conformance.cpp.
