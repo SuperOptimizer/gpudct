@@ -853,6 +853,38 @@ Together: encode **977 -> 1086 MB/s**, with the golden test still passing --
 the bitstream is byte-identical. Approximation was never required; the operands
 were integers all along.
 
+### Encoder-side pre-filtering loses, and the reason generalizes
+
+`--denoise` was on the roadmap on 3ddct's argument that scroll CT is noisy, a transform
+codec spends real bits coding that noise, and removing it first should improve both ratio
+and apparent quality. Tested on real full-resolution PHerc by filtering the volume,
+compressing the filtered version, and scoring against the **original** — scoring against
+the filtered volume would credit the filter for its own distortion, which is how a
+pre-filter can be made to look arbitrarily good.
+
+| pre-filter | ratio | PSNR | 3D-SSIM |
+|---|---|---|---|
+| none | 37.88× | 40.41 | 0.97421 |
+| gauss σ=0.4 | 39.35× | 40.06 | 0.97245 |
+| gauss σ=0.6 | 45.27× | 38.43 | 0.96208 |
+| gauss σ=0.8 | 50.78× | 36.91 | 0.94936 |
+
+The ratio gains are real — σ=0.8 buys 34% — but they are never worth their cost.
+Interpolated to a matched 45× the unfiltered codec gives ≈39.5 dB and 0.967 SSIM against
+σ=0.6's 38.43 dB and 0.962. The same holds at every rate tested from 22× to 160×, and on
+SSIM as well as PSNR, so it is not an artifact of PSNR's known hostility to denoising.
+
+The reason is worth stating because it applies to any fixed pre-filter: the quantizer is
+already a rate-distortion-optimal denoiser. It discards high-frequency content in the
+order that costs the least distortion per bit saved, having seen the actual coefficients.
+A Gaussian discards it in a fixed order chosen in advance. Doing the codec's job for it,
+worse, and then also paying for the residual, cannot come out ahead.
+
+What this does *not* rule out is an **edge-preserving** pre-filter — bilateral, NLM,
+anisotropic diffusion. Those remove noise while leaving the fibre boundaries the
+transform codes efficiently anyway, which is a different proposition from an isotropic
+blur. That remains untested, and it is the only version of this idea still worth trying.
+
 ### Four more things that measured nothing
 
 | change | expected | measured |
