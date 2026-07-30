@@ -326,10 +326,35 @@ overpredicts at coarse quantizers: real reconstruction error cannot exceed the s
 own local variation, so it saturates where the model keeps growing linearly in q. The
 threshold is therefore too large exactly where the filter is most aggressive.
 
-No single constant fixes this — 0.25 is right at 69× and 7× too weak at 21.8×. The fix
-is to stop deriving the threshold from the quantizer alone and clamp it against the
-decoded volume's own local variation, which the decoder already has in hand and which
-is what the metric compares against anyway. Decode-side only, no format change.
+**The fix.** The two limits are combined as a reciprocal sum rather than a minimum:
+
+    1/rms = 1/model_rms + 1/(1.7 * activity)
+
+where `activity` is the mean absolute first difference along the filtered axis, over
+interior steps of the decoded volume — the same quantity the blockiness index divides by,
+measured per axis because scroll data is not isotropic. The form reduces to `model_rms`
+when the quantizer is fine and to `1.7 * activity` when it is coarse, with no
+discontinuity between. A hard `min` was tried first and is wrong: it switches abruptly at
+the crossover and cut the filter to almost nothing across the whole useful rate range
+(+80.1% seam excess at q=0.25, i.e. barely better than off).
+
+The gain constant was fitted by back-solving the measured optima above; it comes out at
+1.74 / 1.64 / 1.78 across a 4× span of `model_rms`, constant to within the measurement,
+which is the evidence that the functional form is right rather than the fit. Strength 1.0
+is now correct at every rate:
+
+| quality | seam excess before | after | PSNR off → on |
+|---|---|---|---|
+| 0.25 | −34.7% | **+5.9%** | 37.10 → 37.36 |
+| 0.5 | −34.7% | **−3.6%** | 40.25 → 40.41 |
+| 1.0 | −20.3% | **−1.1%** | 43.36 → 43.35 |
+
+Confirmed on a second volume with quite different statistics (5–17× rather than 22–69×),
+where the same constant gives +10.2% / +4.4% / +1.0% and PSNR improves at every rate. The
+residual error is on the under-filtered side at the coarsest rates, which is the safe
+direction: a faint remaining seam costs less than smoothing away real structure.
+
+`GPUDCT_DEBLOCK_DEBUG=1` prints the two magnitudes per axis.
 
 
 **Would a 256³ brick be better?** Measured, and no. Rebuilding with `kBrickChunks = 16`
