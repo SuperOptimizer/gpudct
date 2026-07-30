@@ -39,7 +39,7 @@ wants CUDA 13+), `-DGPUDCT_ENABLE_SIMD=ON/OFF`, `-DGPUDCT_WERROR=ON`.
 # raw volume in, archive out
 gpudct compress scroll.raw scroll.gdct --dims 512,512,512 --dtype u8 --quality 0.5
 
-gpudct decompress scroll.gdct out.raw --deblock
+gpudct decompress scroll.gdct out.raw
 gpudct inspect scroll.gdct
 
 # rate-distortion sweep with the full quality metric set

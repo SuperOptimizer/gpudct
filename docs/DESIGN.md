@@ -344,6 +344,19 @@ confuse downstream segmentation. Two options were considered:
   normative reconstruction path, so a decoder may skip it and still be bit-exact with
   respect to the format. Filter strength is signalled in the header as a hint.
 
+It is **on by default**, which is a reversal. The original default was off, on the
+principle that anything altering the reconstruction should be opted into; that was right
+while the filter was believed to trade quality for appearance. It does not. Measured on
+real full-resolution scroll it costs zero bits and raises PSNR at every rate, while
+taking seam excess from +80% / +46% / +25% (at 69x / 38x / 22x) to within a few percent
+of the volume's own interior gradient. Leaving a 16-voxel lattice in the output by
+default -- and a false edge in every downstream gradient and segmentation operator --
+was the worse of the two silences.
+
+The threshold derivation matters as much as the switch: deriving it from the quantizer
+alone over-smoothed faces flatter than the interior, which destroys real signal exactly
+where ink detection looks for it. docs/QUALITY.md 2.2 has the measurement and the fix.
+
 An encoder-side pre-filter (3ddct's `predeblock`) is also worth having as an
 `--denoise` option: scroll CT is noisy, and mild pre-filtering improves both ratio and
 apparent quality. Off by default — it is not lossless-in-intent and shouldn't be silent.

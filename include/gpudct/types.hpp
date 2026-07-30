@@ -214,10 +214,22 @@ struct EncodeOptions {
 };
 
 struct DecodeOptions {
-  // Chunk-boundary deblocking. Off by default because it changes the
-  // reconstruction, and a caller measuring the codec should opt into it
-  // knowingly. On for viewing, generally off for bit-comparison work.
-  bool deblock = false;
+  // Chunk-boundary deblocking.
+  //
+  // On by default. It was off on the argument that it changes the
+  // reconstruction and a caller measuring the codec should opt in knowingly --
+  // which was the right call while it was believed to be a quality trade. It is
+  // not one: measured on real full-resolution scroll it costs zero bits, raises
+  // PSNR at every rate, and takes seam excess from +80%/+46%/+25% down to within
+  // a few percent of the volume's own interior gradient (docs/QUALITY.md 2.2).
+  // A default that leaves a visible 16-voxel lattice in the output, and a false
+  // edge in every downstream gradient operator, is the wrong default.
+  //
+  // Two paths still decline it, both by construction rather than by policy: an
+  // archive carrying a correction layer (deblocking would move voxels after the
+  // corrections that establish the bound), and single-brick random access
+  // (no neighbours to filter against).
+  bool deblock = true;
   // Scales the filter thresholds, which are otherwise derived from the
   // archive's own quantizer. 0 disables, 1 is the calibrated default.
   float deblock_strength = 1.0f;

@@ -38,10 +38,20 @@ Agreement compare_backends(const Volume& v, DType t, const EncodeOptions& opts) 
   std::vector<std::uint8_t> archive;
   if (encode(raw.data(), v.dims, t, opts, archive) != Status::ok) return a;
 
+  // Deblocking off, deliberately. It is not in the normative reconstruction path
+  // (docs/DESIGN.md 3.8) and it is a *conditional* filter, so a legal 1-LSB
+  // difference between backends can land either side of a threshold and make the
+  // filter fire on one and not the other. That turns a 1-LSB divergence into one
+  // the size of the filter's clip -- measured at 5 LSB on u16 once deblocking
+  // became the default. Amplified threshold noise is not a backend disagreement,
+  // and testing through it would hide the thing this test exists to catch.
+  DecodeOptions dopts;
+  dopts.deblock = false;
+
   std::vector<std::uint8_t> cpu, gpu;
   VolumeInfo ic, ig;
-  if (decode(archive, DecodeOptions{}, cpu, ic, Backend::cpu_scalar) != Status::ok) return a;
-  if (decode(archive, DecodeOptions{}, gpu, ig, Backend::cuda) != Status::ok) return a;
+  if (decode(archive, dopts, cpu, ic, Backend::cpu_scalar) != Status::ok) return a;
+  if (decode(archive, dopts, gpu, ig, Backend::cuda) != Status::ok) return a;
   if (cpu.size() != gpu.size()) return a;
 
   const std::vector<float> fc = from_typed(cpu, t, v.data.size());
@@ -109,6 +119,42 @@ TEST(cuda_handles_every_dtype) {
                   a.max_abs, lsb);
     CHECK(a.max_abs <= lsb);
   }
+}
+
+// The equivalence tests above deliberately bypass deblocking, so this is what
+// keeps the default path covered. The bar is looser and it has to be: the filter
+// is conditional, so where the two backends differ by a legal 1 LSB the filter
+// can fire on one and not the other, and the resulting difference is bounded by
+// its clip rather than by the reconstruction difference. What must still hold is
+// that this stays rare and bounded -- a systematic divergence would show up as a
+// large differing fraction, not as a handful of amplified voxels.
+TEST(cuda_deblocked_output_agrees_within_the_filter_bound) {
+  if (!cuda_ready()) return;
+  const Volume v = scroll_like_volume({144, 144, 144});
+  const std::vector<std::uint8_t> raw = to_typed(v, DType::u8);
+  EncodeOptions opts;
+  opts.quality = 1.0f;
+  opts.streams_per_brick = 16;
+  std::vector<std::uint8_t> archive;
+  REQUIRE(encode(raw.data(), v.dims, DType::u8, opts, archive) == Status::ok);
+
+  std::vector<std::uint8_t> cpu, gpu;
+  VolumeInfo ic, ig;
+  REQUIRE(decode(archive, DecodeOptions{}, cpu, ic, Backend::cpu_scalar) == Status::ok);
+  REQUIRE(decode(archive, DecodeOptions{}, gpu, ig, Backend::cuda) == Status::ok);
+  REQUIRE(cpu.size() == gpu.size());
+
+  double maxd = 0;
+  std::size_t diff = 0;
+  for (std::size_t i = 0; i < cpu.size(); ++i) {
+    const double e = std::fabs(static_cast<double>(cpu[i]) - static_cast<double>(gpu[i]));
+    maxd = std::max(maxd, e);
+    if (e != 0.0) ++diff;
+  }
+  const double frac = static_cast<double>(diff) / static_cast<double>(cpu.size());
+  std::printf("       deblocked: max %.0f  differing %.2e\n", maxd, frac);
+  CHECK(maxd <= 8.0);
+  CHECK(frac < 1e-3);
 }
 
 // Dimensions that leave partial bricks exercise the crop path in the CUDA host

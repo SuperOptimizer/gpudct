@@ -47,7 +47,10 @@ compression options:
   --qamp A         radial amplitude of the quant matrix (default per profile)
   --max-abs T      hard bound on absolute error, in input units. On an integer
                    dtype, 0.5 is lossless: half a step forces exact rounding.
-  --deblock        apply the chunk-boundary deblocking filter on decode
+  --no-deblock     skip the chunk-boundary deblocking filter. It is on by
+                   default: it costs no bits, raises PSNR, and removes the
+                   16-voxel seam lattice. Use this to measure the format's
+                   defined reconstruction on its own.
   --deblock-strength S   scale the filter thresholds; 1.0 is calibrated,
                    0 disables. Implies --deblock when > 0.
   --reps N         bench: repeat each point N times and keep the best
@@ -67,7 +70,7 @@ struct Args {
   int reps = 1;
   EncodeOptions enc{};
   Backend backend = Backend::automatic;
-  bool deblock = false;
+  bool deblock = true;
   float deblock_strength = 1.0f;
   float deadzone = -1.0f;  // <0 = profile default
   float qshape = -1.0f;    // <0 = profile default (radial exponent b)
@@ -149,6 +152,8 @@ bool parse(int argc, char** argv, Args& a) {
       a.enc.bounds.max_abs = std::strtof(v, nullptr);
     } else if (s == "--deblock") {
       a.deblock = true;
+    } else if (s == "--no-deblock") {
+      a.deblock = false;
     } else if (s == "--deblock-strength") {
       const char* v = next("--deblock-strength");
       if (!v) return false;
