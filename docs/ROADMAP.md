@@ -21,7 +21,10 @@ M0-M5 are implemented and tested; M6 is partly done. What exists and works:
 - Raw-brick fallback, so incompressible input never expands.
 - Bounded-error correction layer: absolute, relative, and percentile modes. The
   percentile mode costs ~2.3x less than the equivalent hard bound.
-- Deblocking filter (+2.5 dB on smooth content at low rate).
+- Deblocking filter, on by default. Calibrated against the decoded volume's own
+  local activity rather than the quantizer alone, which was over-smoothing chunk
+  faces flatter than the interior and costing PSNR outright at high quality
+  (docs/QUALITY.md 2.2).
 - Full metric suite and RD bench harness; 63 tests across 6 binaries.
 - Lane-parallel SIMD transform, bit-identical to scalar.
 
@@ -34,11 +37,17 @@ than pending -- DC carries 0.1-0.5% of coded bits, so there is nothing there to
 predict. The quantizer matrix has been swept and is a PSNR/SSIM frontier rather
 than a missed win (docs/QUALITY.md).
 
-Not yet done: Zarr integration, baselines against ZFP/SZ3, CI of any kind,
-and CUDA stream overlap -- every device transfer is still a synchronous
-`cudaMemcpy` on the default stream, so no batch's host preparation overlaps any
-other batch's kernels. 3ddct is measured at -16.97% BD-rate at `--effort high`
-(see docs/QUALITY.md).
+Since also done: CI (build matrix, sanitizers, format), a stored-archive
+conformance corpus with decoder mangling tests, thread-safety tests, fast
+floating point (+25% CPU decode at identical ratio, with GPUDCT_STRICT_FP=ON to
+restore exact reproducibility for bounded-error archives), CUDA readback
+overlapped with decode (2140 -> ~3300 MB/s on a 1 GiB volume), and memory-mapped
+volume I/O (decompress peak RSS 2139 -> 1303 MB).
+
+Not yet done: Zarr integration, baselines against ZFP/SZ3, isosurface
+displacement (the one QUALITY.md 1.3 metric still missing), and a downstream
+ink-detection check at the 25-50x operating points. 3ddct is measured at -16.97%
+BD-rate at `--effort high` (see docs/QUALITY.md).
 
 Measured on a real full-resolution 128^3 brick from `PHerc0332` (one brick = one
 Zarr chunk of the open dataset), balanced profile:
