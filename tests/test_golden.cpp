@@ -88,6 +88,12 @@ bool encode_case(const GoldenCase& c, Backend backend, std::vector<std::uint8_t>
   VolumeInfo info;
   DecodeOptions dopts;
   dopts.threads = 1;
+  // Deblocking off: this test is about the *format*, and the filter is not in
+  // the normative reconstruction path (docs/DESIGN.md 3.8). Leaving it on made
+  // the recorded RMSE a function of the filter's tuning, so retuning the filter
+  // churned these references while the bitstream -- byte-identical in size and
+  // content -- had not changed at all. test_deblock covers the filter.
+  dopts.deblock = false;
   return decode(archive, dopts, decoded, info, backend) == Status::ok;
 }
 
@@ -119,15 +125,12 @@ struct Golden {
   double rmse;
 };
 
-// Recorded with the default DecodeOptions, which now deblocks. On these small
-// synthetic volumes that barely moves the number -- the ramp gains 1.1%, the
-// rest are unchanged to three decimals -- because they have almost no
-// chunk-boundary energy to begin with. The gain is on real scroll data.
+// Recorded from the format's defined reconstruction, with deblocking off.
 const Golden kGolden[] = {
-    {44067, 2.6435507980},   // scroll-u8-balanced-q1
-    {373339, 3.3813670817},  // scroll-u16-archival-q05
-    {2785, 1.3918776745},    // ramp-u8-viewing-q025
-    {242036, 2.7868931131},  // noise-u8-balanced-q2
+    {44067, 2.6419344633},   // scroll-u8-balanced-q1
+    {373339, 3.3816868978},  // scroll-u16-archival-q05
+    {2785, 1.4075758277},    // ramp-u8-viewing-q025
+    {242036, 2.7868992727},  // noise-u8-balanced-q2
 };
 
 // Size is asserted exactly; it has no reason to drift by one byte for a legal

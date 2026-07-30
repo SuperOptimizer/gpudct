@@ -299,7 +299,13 @@ void deblock_volume(void* data, Dims dims, DType t, float scale, float offset, f
   // need every one of them.
   auto activity = [&](int ax) {
     const int a1 = (ax + 1) % 3, a2 = (ax + 2) % 3;
-    const std::uint32_t stride = 4;
+    // Stride 16, not 4. This is a single scalar per axis averaged over hundreds
+    // of thousands of steps, so its precision needs are trivial -- but the pass
+    // reads every voxel *along* the filtered axis, so at stride 4 it touched as
+    // many voxels as the filter itself and roughly doubled the cost of
+    // deblocking. Stride 16 samples 1/16 as many lines and moves the estimate by
+    // well under a percent.
+    const std::uint32_t stride = 16;
     double acc = 0.0;
     std::uint64_t n = 0;
     for (std::uint32_t u = 0; u < lim[a1]; u += stride)

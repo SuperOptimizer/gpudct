@@ -428,6 +428,7 @@ Status decode_archive_attempt(std::span<const std::uint8_t> archive, const FileH
     cudaFree(d_archive);
   };
 
+  const auto t_alloc = std::chrono::steady_clock::now();
   const std::size_t volume_bytes = h.dims.voxels() * esz;
   const bool direct = cudaMalloc(&d_volume, volume_bytes) == cudaSuccess &&
                       cudaMalloc(&d_origins, batch * 3 * sizeof(std::uint32_t)) == cudaSuccess;
@@ -455,6 +456,10 @@ Status decode_archive_attempt(std::span<const std::uint8_t> archive, const FileH
   }
 
   if (out.size() != h.dims.voxels() * esz) return Status::invalid_argument;
+  if (std::getenv("GPUDCT_CUDA_PROFILE"))
+    std::fprintf(stderr, "[cuda] setup (alloc+archive+models) %8.2f ms\n",
+                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t_alloc)
+                         .count() * 1000.0);
   StageTimer timer;
   std::vector<BrickDesc> descs(batch);
   std::vector<std::uint32_t> origins(batch * 3);
@@ -804,7 +809,12 @@ Status decode_archive_attempt(std::span<const std::uint8_t> archive, const FileH
     timer.accumulate(timer.download_ms, timer.c, timer.d);
   }
 
+  const auto t_free = std::chrono::steady_clock::now();
   cleanup();
+  if (std::getenv("GPUDCT_CUDA_PROFILE"))
+    std::fprintf(stderr, "[cuda] teardown (unregister+free) %8.2f ms\n",
+                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t_free)
+                         .count() * 1000.0);
   return Status::ok;
 }
 

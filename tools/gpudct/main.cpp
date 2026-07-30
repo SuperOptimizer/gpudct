@@ -376,6 +376,13 @@ int cmd_bench(const Args& a) {
       // already offers decode_into for callers who can reuse one.
       DecodeOptions dopts;
       dopts.threads = a.enc.threads;
+      // Was omitted, which silently pinned every bench to the default. Once
+      // deblocking became that default, the throughput reported here included a
+      // filter pass the flags claimed to have turned off -- and an A/B of
+      // --no-deblock against it showed no difference, because both sides were
+      // deblocking.
+      dopts.deblock = a.deblock;
+      dopts.deblock_strength = a.deblock_strength;
       VolumeInfo info;
       const auto t1 = std::chrono::steady_clock::now();
       if (decode_into(archive, dopts, decoded, info, a.backend) != Status::ok) return 1;
