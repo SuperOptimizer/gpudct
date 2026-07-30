@@ -291,12 +291,45 @@ seam-free joins, at the operating points in use:
 
 About 3 dB in our favour, on top of 2.4× decode throughput.
 
-Two consequences for this codec, neither yet acted on. `--deblock` is **off by default**
-while improving PSNR, removing seams, and costing nothing, which makes the default wrong
-for every use except bit-exactness testing. And the filter over-corrects: blockiness
-lands at 0.59–0.66 where 1.0 is seamless, so it smooths chunk faces *more* than the
-interior and is likely destroying real signal there — exactly the failure that matters
-for ink detection. Reducing the filter strength is an unexploited improvement.
+Two consequences for this codec. `--deblock` is **off by default** while improving PSNR,
+removing seams, and costing nothing, which makes the default wrong for every use except
+bit-exactness testing. And the calibrated strength of 1.0 is wrong — see below.
+
+### 2.2 The deblocking filter is calibrated too strong
+
+`DeblockThresholds::from` derives its thresholds from the quantizer matrix, on the
+argument that a dead-zone quantizer with step q leaves error variance q²/12, so one
+strength setting should work across every profile and quality. Swept against the
+blockiness index rather than against PSNR alone, it does not. Real full-resolution
+PHerc scroll CT, 512³, seam excess over the original volume's own 0.9987 (16³ faces):
+
+| strength | q=0.25, 69× | q=0.5, 37.9× | q=1.0, 21.8× |
+|---|---|---|---|
+| off | +80.1% | +45.9% | +25.2% |
+| 0.25 | **+3.1%** | +21.7% | +21.1% |
+| 0.40 | −24.6% | **−3.0%** | +13.1% |
+| 0.50 | −31.2% | −14.1% | +4.7% |
+| 0.60 | −33.5% | −21.7% | **−1.8%** |
+| 1.00 (shipped) | −34.7% | −34.7% | −20.3% |
+
+The index is a ratio, so both directions are failures: above 1.0 the seams are visible,
+below it the filter is smoothing chunk faces *more* than the interior, which is signal
+removal precisely where a downstream gradient or segmentation operator will look. The
+shipped strength overshoots at every rate, and the overshoot is not free — at q=1.0 it
+costs PSNR outright (43.26 dB against 43.36 dB with the filter off, where strength 0.5
+gives 43.38 dB). Seam-optimal strength is roughly 0.25 / 0.40 / 0.60 across the three
+rates, i.e. it *rises* with quality.
+
+That trend is the diagnosis. The q²/12 model is scale-free, so if it were right the
+optimal multiplier would be constant. It rises with quality because the model
+overpredicts at coarse quantizers: real reconstruction error cannot exceed the signal's
+own local variation, so it saturates where the model keeps growing linearly in q. The
+threshold is therefore too large exactly where the filter is most aggressive.
+
+No single constant fixes this — 0.25 is right at 69× and 7× too weak at 21.8×. The fix
+is to stop deriving the threshold from the quantizer alone and clamp it against the
+decoded volume's own local variation, which the decoder already has in hand and which
+is what the metric compares against anyway. Decode-side only, no format change.
 
 
 **Would a 256³ brick be better?** Measured, and no. Rebuilding with `kBrickChunks = 16`
