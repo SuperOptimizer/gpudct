@@ -196,7 +196,7 @@ struct StageTimer {
         1000.0;
     std::fprintf(stderr,
                  "[cuda] k1 (entropy) %8.2f ms   k2 (transform) %8.2f ms   "
-                 "download %8.2f ms\n"
+                 "readback wait %8.2f ms\n"
                  "[cuda] host prep %8.2f ms   total %8.2f ms   unaccounted %8.2f ms\n",
                  k1_ms, k2_ms, download_ms, host_ms, total,
                  total - k1_ms - k2_ms - download_ms - host_ms);
@@ -216,8 +216,12 @@ struct StageTimer {
     }
     ~HostSpan() { stop(); }
   };
-  void mark(cudaEvent_t e) {
-    if (on) cudaEventRecord(e);
+  // The stream matters. Kernels run on the decoder's compute stream, so an
+  // event recorded on the null stream sits in a different queue and measures
+  // nothing -- it reported 0.01 ms for kernels that plainly take tens of
+  // milliseconds, and quietly moved their cost into `unaccounted`.
+  void mark(cudaEvent_t e, cudaStream_t s = nullptr) {
+    if (on) cudaEventRecord(e, s);
   }
   void accumulate(float& into, cudaEvent_t from, cudaEvent_t to) {
     if (!on) return;
@@ -274,6 +278,11 @@ namespace {
 constexpr std::uint32_t kErrCorrupt = 1;
 constexpr std::uint32_t kErrOverflow = 2;
 
+// How many batches to split a whole-volume decode into, so the readback of one
+// slab overlaps the decode of the next. Swept on a 1 GiB volume; see
+// docs/QUALITY.md.
+constexpr int kDecodeBatchSplit = 4;
+
 Status decode_archive_attempt(std::span<const std::uint8_t> archive, const FileHeader& h,
                               const QuantMatrix& qm, const ModelSet& ms,
                               std::uint32_t attempt_max_nz, std::span<std::uint8_t> out,
@@ -321,6 +330,36 @@ Status decode_archive_attempt(std::span<const std::uint8_t> archive, const FileH
   std::size_t batch = std::max<std::size_t>(1, budget / per_brick);
   batch = std::min<std::size_t>(batch, static_cast<std::size_t>(h.brick_count));
 
+  // Round the batch down to a whole z-layer of bricks.
+  //
+  // Bricks are indexed x fastest, so a run of grid.x * grid.y consecutive
+  // bricks is exactly one 128-voxel z-slab of the volume -- and in the volume's
+  // own layout that slab is one contiguous byte range. That is what makes a
+  // per-batch readback a single DMA instead of a scatter, which in turn is what
+  // lets the readback overlap the next batch's kernels. Without the rounding a
+  // batch straddles slabs and the copy would have to be split per brick row.
+  const Dims grid = brick_grid(h.dims);
+  const std::size_t bricks_per_layer = static_cast<std::size_t>(grid.x) * grid.y;
+  const bool slab_pipelined = batch >= bricks_per_layer;
+  if (slab_pipelined) batch -= batch % bricks_per_layer;
+
+  // Deliberately split the work into several batches even when it would all
+  // fit at once. Sizing the batch purely by what device memory allows produces
+  // exactly one batch for any volume that fits, and a single batch has nothing
+  // to overlap: the readback is issued after the last kernel and simply waited
+  // on. Splitting costs a little per-batch launch and table-upload overhead and
+  // buys the readback of slab k running underneath the decode of slab k+1.
+  if (slab_pipelined) {
+    static const int split = [] {
+      const char* e = std::getenv("GPUDCT_BATCH_SPLIT");
+      const int v = e ? std::atoi(e) : kDecodeBatchSplit;
+      return v > 0 ? v : kDecodeBatchSplit;
+    }();
+    const std::size_t layers = static_cast<std::size_t>(grid.z);
+    const std::size_t want = std::max<std::size_t>(1, layers / static_cast<std::size_t>(split));
+    batch = std::min(batch, want * bricks_per_layer);
+  }
+
   // Pinned staging for the readback. Pageable memory forces the driver to stage
   // through its own pinned buffer, which roughly halves achievable PCIe
   // bandwidth -- and the readback measured comparable to the entropy kernel, so
@@ -353,7 +392,21 @@ Status decode_archive_attempt(std::span<const std::uint8_t> archive, const FileH
   std::uint32_t* d_tab_base = nullptr;
   std::uint32_t* d_tab_count = nullptr;
 
+  // Two non-blocking streams. Non-blocking matters: a stream created with the
+  // default flags implicitly synchronizes with the null stream, and the small
+  // scratch uploads still go there, so blocking streams would serialize the
+  // readback right back against the kernels it is meant to overlap.
+  cudaStream_t s_compute = nullptr, s_copy = nullptr;
+  const bool streams_ok =
+      cudaStreamCreateWithFlags(&s_compute, cudaStreamNonBlocking) == cudaSuccess &&
+      cudaStreamCreateWithFlags(&s_copy, cudaStreamNonBlocking) == cudaSuccess;
+  bool out_registered = false;
+
   auto cleanup = [&] {
+    if (s_copy) cudaStreamSynchronize(s_copy);
+    if (out_registered) cudaHostUnregister(out.data());
+    if (s_compute) cudaStreamDestroy(s_compute);
+    if (s_copy) cudaStreamDestroy(s_copy);
     if (host_pinned && host_bricks) cudaFreeHost(host_bricks);
     cudaFree(d_levels);
     cudaFree(d_indices);
@@ -403,7 +456,6 @@ Status decode_archive_attempt(std::span<const std::uint8_t> archive, const FileH
 
   if (out.size() != h.dims.voxels() * esz) return Status::invalid_argument;
   StageTimer timer;
-  const Dims grid = brick_grid(h.dims);
   std::vector<BrickDesc> descs(batch);
   std::vector<std::uint32_t> origins(batch * 3);
   std::vector<std::uint16_t> tab_freq;
@@ -432,6 +484,31 @@ Status decode_archive_attempt(std::span<const std::uint8_t> archive, const FileH
         shared_limit = static_cast<std::size_t>(per_block_optin);
     }
   }
+
+  // Pipelined readback: each batch's slab is copied out on `s_copy` while the
+  // next batch is prepared and decoded on `s_compute`. Measured on a warm 1 GiB
+  // decode the readback and the compute side were 140 ms and 134 ms, so almost
+  // the whole copy hides behind work that has to happen anyway.
+  //
+  // The destination is pinned once here rather than around the final copy.
+  // cudaMemcpyAsync into pageable memory is not actually asynchronous, so
+  // without this the pipeline would silently degrade to the serial behaviour.
+  const bool pipelined = direct && slab_pipelined && streams_ok;
+  if (pipelined) {
+    prefault(out.data(), volume_bytes);
+    out_registered =
+        cudaHostRegister(out.data(), volume_bytes, cudaHostRegisterDefault) == cudaSuccess;
+  }
+  const cudaStream_t ks = streams_ok ? s_compute : cudaStream_t{nullptr};
+  static const bool profile = std::getenv("GPUDCT_CUDA_PROFILE") != nullptr;
+  if (profile)
+    std::fprintf(stderr,
+                 "[cuda] pipelined=%d direct=%d streams=%d registered=%d batch=%zu "
+                 "layer=%zu batches=%llu\n",
+                 static_cast<int>(pipelined), static_cast<int>(direct),
+                 static_cast<int>(streams_ok), static_cast<int>(out_registered), batch,
+                 bricks_per_layer,
+                 static_cast<unsigned long long>((h.brick_count + batch - 1) / batch));
 
   for (std::uint64_t b0 = 0; b0 < h.brick_count; b0 += batch) {
     const std::uint32_t n = static_cast<std::uint32_t>(
@@ -500,7 +577,7 @@ Status decode_archive_attempt(std::span<const std::uint8_t> archive, const FileH
         cleanup();
         return Status::io_error;
       }
-      k0_build_brick_tables<<<ntab, 256>>>(d_tab_freq, d_tab_fc, d_tab_slot, ntab);
+      k0_build_brick_tables<<<ntab, 256, 0, ks>>>(d_tab_freq, d_tab_fc, d_tab_slot, ntab);
     }
     if (cudaMemcpy(d_tab_map, tab_map.data(), tab_map.size(), cudaMemcpyHostToDevice) !=
             cudaSuccess ||
@@ -518,7 +595,7 @@ Status decode_archive_attempt(std::span<const std::uint8_t> archive, const FileH
     }
 
     prep.stop();
-    timer.mark(timer.a);
+    timer.mark(timer.a, ks);
     {
       DeviceBrickTables bt{d_tab_fc, d_tab_slot, d_tab_map, d_tab_base};
       // Two launches, chosen by what limits this batch.
@@ -539,23 +616,23 @@ Status decode_archive_attempt(std::span<const std::uint8_t> archive, const FileH
                               h.streams_per_brick >= 32 &&
                               shared_bytes <= shared_limit;
       if (use_shared) {
-        k1_entropy_decode_shared<<<n, h.streams_per_brick, shared_bytes>>>(
+        k1_entropy_decode_shared<<<n, h.streams_per_brick, shared_bytes, ks>>>(
             d_descs, dm, bt, d_tab_count, max_level, d_levels, d_indices, d_counts, max_nz, n,
             d_error);
       } else {
         const std::uint32_t total_threads = n * h.streams_per_brick;
         const std::uint32_t blocks = (total_threads + kK1Threads - 1) / kK1Threads;
-        k1_entropy_decode<<<blocks, kK1Threads>>>(d_descs, dm, bt, max_level, d_levels,
+        k1_entropy_decode<<<blocks, kK1Threads, 0, ks>>>(d_descs, dm, bt, max_level, d_levels,
                                                   d_indices, d_counts, max_nz,
                                                   h.streams_per_brick, n, d_error);
       }
     }
 
-    timer.mark(timer.b);
+    timer.mark(timer.b, ks);
     if (direct) {
       const dim3 blocks(n * kChunksPerBrick);
 #define GPUDCT_K2_DIRECT(T)                                                                  \
-  k2_inverse_transform_direct<T><<<blocks, 256>>>(                                           \
+  k2_inverse_transform_direct<T><<<blocks, 256, 0, ks>>>(                                           \
       d_levels, d_indices, d_counts, max_nz, d_quant, h.data_scale, h.data_offset, lo, hi,   \
       d_origins, h.dims.x, h.dims.y, h.dims.z, reinterpret_cast<T*>(d_volume))
       switch (h.dtype) {
@@ -572,45 +649,49 @@ Status decode_archive_attempt(std::span<const std::uint8_t> archive, const FileH
       const dim3 blocks(n * kChunksPerBrick);
       switch (h.dtype) {
         case DType::u8:
-          k2_inverse_transform<std::uint8_t><<<blocks, 256>>>(
+          k2_inverse_transform<std::uint8_t><<<blocks, 256, 0, ks>>>(
               d_levels, d_indices, d_counts, max_nz, d_quant, h.data_scale, h.data_offset, lo,
               hi, reinterpret_cast<std::uint8_t*>(d_out));
           break;
         case DType::s8:
-          k2_inverse_transform<std::int8_t><<<blocks, 256>>>(
+          k2_inverse_transform<std::int8_t><<<blocks, 256, 0, ks>>>(
               d_levels, d_indices, d_counts, max_nz, d_quant, h.data_scale, h.data_offset, lo,
               hi, reinterpret_cast<std::int8_t*>(d_out));
           break;
         case DType::u16:
-          k2_inverse_transform<std::uint16_t><<<blocks, 256>>>(
+          k2_inverse_transform<std::uint16_t><<<blocks, 256, 0, ks>>>(
               d_levels, d_indices, d_counts, max_nz, d_quant, h.data_scale, h.data_offset, lo,
               hi, reinterpret_cast<std::uint16_t*>(d_out));
           break;
         case DType::s16:
-          k2_inverse_transform<std::int16_t><<<blocks, 256>>>(
+          k2_inverse_transform<std::int16_t><<<blocks, 256, 0, ks>>>(
               d_levels, d_indices, d_counts, max_nz, d_quant, h.data_scale, h.data_offset, lo,
               hi, reinterpret_cast<std::int16_t*>(d_out));
           break;
         case DType::u32:
-          k2_inverse_transform<std::uint32_t><<<blocks, 256>>>(
+          k2_inverse_transform<std::uint32_t><<<blocks, 256, 0, ks>>>(
               d_levels, d_indices, d_counts, max_nz, d_quant, h.data_scale, h.data_offset, lo,
               hi, reinterpret_cast<std::uint32_t*>(d_out));
           break;
         case DType::s32:
-          k2_inverse_transform<std::int32_t><<<blocks, 256>>>(
+          k2_inverse_transform<std::int32_t><<<blocks, 256, 0, ks>>>(
               d_levels, d_indices, d_counts, max_nz, d_quant, h.data_scale, h.data_offset, lo,
               hi, reinterpret_cast<std::int32_t*>(d_out));
           break;
         case DType::f32:
-          k2_inverse_transform<float><<<blocks, 256>>>(
+          k2_inverse_transform<float><<<blocks, 256, 0, ks>>>(
               d_levels, d_indices, d_counts, max_nz, d_quant, h.data_scale, h.data_offset, lo,
               hi, reinterpret_cast<float*>(d_out));
           break;
       }
     }
 
-    timer.mark(timer.c);
-    if (cudaDeviceSynchronize() != cudaSuccess) {
+    timer.mark(timer.c, ks);
+    // Only the compute stream: waiting on the whole device here would also wait
+    // on the previous batch's readback, which is exactly the overlap we want.
+    // The scratch buffers are safe to reuse once these kernels have retired.
+    if ((streams_ok ? cudaStreamSynchronize(s_compute) : cudaDeviceSynchronize()) !=
+        cudaSuccess) {
       cleanup();
       return Status::io_error;
     }
@@ -627,6 +708,27 @@ Status decode_archive_attempt(std::span<const std::uint8_t> archive, const FileH
     }
 
     if (direct) {
+      if (pipelined) {
+        // This batch is a whole number of z-slabs, so its output is one
+        // contiguous range of both d_volume and out.
+        const std::uint64_t z0 = (b0 / bricks_per_layer) * kBrickDim;
+        const std::uint64_t z1 =
+            std::min<std::uint64_t>(h.dims.z, z0 + (n / bricks_per_layer) * kBrickDim);
+        const std::size_t plane = static_cast<std::size_t>(h.dims.y) * h.dims.x * esz;
+        const std::size_t off = static_cast<std::size_t>(z0) * plane;
+        const std::size_t len = static_cast<std::size_t>(z1 - z0) * plane;
+        if (cudaMemcpyAsync(out.data() + off, d_volume + off, len, cudaMemcpyDeviceToHost,
+                            s_copy) != cudaSuccess) {
+          cleanup();
+          return Status::io_error;
+        }
+        // Flush the submission. Under WDDM the driver batches commands in user
+        // space and does not hand them to the GPU until something forces it, so
+        // without this the whole point of the copy stream is lost: the copies
+        // sit unsubmitted and all run at the final synchronize. cudaStreamQuery
+        // is the documented way to push the batch without blocking.
+        (void)cudaStreamQuery(s_copy);
+      }
       timer.mark(timer.d);
       timer.accumulate(timer.k1_ms, timer.a, timer.b);
       timer.accumulate(timer.k2_ms, timer.b, timer.c);
@@ -668,7 +770,16 @@ Status decode_archive_attempt(std::span<const std::uint8_t> archive, const FileH
     }
   }
 
-  if (direct) {
+  if (direct && pipelined) {
+    timer.mark(timer.c);
+    const cudaError_t copy = cudaStreamSynchronize(s_copy);
+    timer.mark(timer.d);
+    timer.accumulate(timer.download_ms, timer.c, timer.d);
+    if (copy != cudaSuccess) {
+      cleanup();
+      return Status::io_error;
+    }
+  } else if (direct) {
     timer.mark(timer.c);
     // Pin the destination in place rather than staging through a separate
     // pinned buffer: a D2H copy into pageable memory runs at roughly half rate

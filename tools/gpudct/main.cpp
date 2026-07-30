@@ -232,6 +232,9 @@ int cmd_compress(const Args& a) {
               8.0 * static_cast<double>(archive.size()) / static_cast<double>(a.dims.voxels()));
   std::printf("%-14s %12.3f s (%.1f MB/s)\n", "encode", dt,
               static_cast<double>(raw.size()) / dt / 1e6);
+  // Reported separately, never folded into the throughput above: it is a
+  // once-per-process driver cost, not something the codec does per volume.
+  if (warm > 0.0) std::printf("%-14s %12.3f s\n", "backend init", warm);
   return 0;
 }
 
@@ -284,6 +287,7 @@ int cmd_decompress(const Args& a) {
   print_size("output", nbytes);
   std::printf("%-14s %12.3f s (%.1f MB/s)\n", "decode", dt,
               static_cast<double>(nbytes) / dt / 1e6);
+  if (warm > 0.0) std::printf("%-14s %12.3f s\n", "backend init", warm);
   return 0;
 }
 
