@@ -139,20 +139,21 @@ struct Gauss {
   }
 };
 
-void blur(const std::vector<float>& in, std::vector<float>& out, Dims d) {
+void blur(const float* in, std::vector<float>& out, Dims d) {
   static const Gauss g;
-  std::vector<float> tmp(in.size());
+  const std::size_t n = d.voxels();
+  std::vector<float> tmp(n);
   // x
   for (std::uint32_t z = 0; z < d.z; ++z)
     for (std::uint32_t y = 0; y < d.y; ++y)
       for (std::uint32_t x = 0; x < d.x; ++x) {
         float acc = 0.0f;
         for (int i = -Gauss::R; i <= Gauss::R; ++i)
-          acc += g.k[i + Gauss::R] * sample(in.data(), d, static_cast<std::int64_t>(x) + i, y, z);
+          acc += g.k[i + Gauss::R] * sample(in, d, static_cast<std::int64_t>(x) + i, y, z);
         tmp[idx_of(d, x, y, z)] = acc;
       }
   // y
-  std::vector<float> tmp2(in.size());
+  std::vector<float> tmp2(n);
   for (std::uint32_t z = 0; z < d.z; ++z)
     for (std::uint32_t y = 0; y < d.y; ++y)
       for (std::uint32_t x = 0; x < d.x; ++x) {
@@ -162,7 +163,11 @@ void blur(const std::vector<float>& in, std::vector<float>& out, Dims d) {
         tmp2[idx_of(d, x, y, z)] = acc;
       }
   // z
-  out.assign(in.size(), 0.0f);
+  // tmp is dead once the y pass has read it; on a 1 GiB volume that is 4 GiB
+  // held for no reason while the z pass runs.
+  tmp.clear();
+  tmp.shrink_to_fit();
+  out.assign(n, 0.0f);
   for (std::uint32_t z = 0; z < d.z; ++z)
     for (std::uint32_t y = 0; y < d.y; ++y)
       for (std::uint32_t x = 0; x < d.x; ++x) {
@@ -178,27 +183,33 @@ void blur(const std::vector<float>& in, std::vector<float>& out, Dims d) {
 void compute_ssim(const float* a, const float* b, Dims d, double dyn_range, double& mean,
                   double& p01) {
   const std::size_t n = d.voxels();
-  std::vector<float> x(a, a + n), y(b, b + n), xx(n), yy(n), xy(n);
-  for (std::size_t i = 0; i < n; ++i) {
-    xx[i] = x[i] * x[i];
-    yy[i] = y[i] * y[i];
-    xy[i] = x[i] * y[i];
-  }
+
+  // Each product is built, blurred, and released before the next one exists.
+  // This used to hold x, y, xx, yy and xy simultaneously -- x and y being plain
+  // copies of the arguments -- which on a 1024^3 volume is 20 GiB of float
+  // before any of the blurs allocate their own temporaries.
   std::vector<float> mx, my, mxx, myy, mxy;
-  blur(x, mx, d);
-  blur(y, my, d);
-  blur(xx, mxx, d);
-  blur(yy, myy, d);
-  blur(xy, mxy, d);
+  blur(a, mx, d);
+  blur(b, my, d);
+  {
+    std::vector<float> prod(n);
+    for (std::size_t i = 0; i < n; ++i) prod[i] = a[i] * a[i];
+    blur(prod.data(), mxx, d);
+    for (std::size_t i = 0; i < n; ++i) prod[i] = b[i] * b[i];
+    blur(prod.data(), myy, d);
+    for (std::size_t i = 0; i < n; ++i) prod[i] = a[i] * b[i];
+    blur(prod.data(), mxy, d);
+  }
 
   const double c1 = std::pow(0.01 * dyn_range, 2.0);
   const double c2 = std::pow(0.03 * dyn_range, 2.0);
 
-  std::vector<float> map(n);
+  // The map is written over mxx, which is dead as soon as its value is read.
+  std::vector<float> map = std::move(mxx);
   double sum = 0.0;
   for (std::size_t i = 0; i < n; ++i) {
     const double ux = mx[i], uy = my[i];
-    const double vx = std::max(0.0, static_cast<double>(mxx[i]) - ux * ux);
+    const double vx = std::max(0.0, static_cast<double>(map[i]) - ux * ux);
     const double vy = std::max(0.0, static_cast<double>(myy[i]) - uy * uy);
     const double vxy = static_cast<double>(mxy[i]) - ux * uy;
     const double s = ((2 * ux * uy + c1) * (2 * vxy + c2)) /
@@ -209,11 +220,11 @@ void compute_ssim(const float* a, const float* b, Dims d, double dyn_range, doub
   mean = sum / static_cast<double>(n);
 
   // The 1st percentile of the map says more than its mean: it is the regions
-  // that were actually damaged.
-  std::vector<float> sorted = map;
+  // that were actually damaged. Partitioned in place -- the map is not needed
+  // afterwards, and copying it first cost a whole extra volume.
   const std::size_t k = static_cast<std::size_t>(0.01 * static_cast<double>(n));
-  std::nth_element(sorted.begin(), sorted.begin() + static_cast<std::ptrdiff_t>(k), sorted.end());
-  p01 = sorted[k];
+  std::nth_element(map.begin(), map.begin() + static_cast<std::ptrdiff_t>(k), map.end());
+  p01 = map[k];
 }
 
 // 3D Sobel gradient magnitude: derivative along one axis, [1 2 1] smoothing on
