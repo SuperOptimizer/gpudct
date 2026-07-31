@@ -31,6 +31,7 @@
 #include "core/quant.hpp"
 #include "core/brick_tables.hpp"
 #include "core/rdo.hpp"
+#include "core/deblock.hpp"
 #include "gpudct/gpudct.hpp"
 #include "gpudct/device_volume.hpp"
 #include "cuda/cuda_backend.hpp"
@@ -286,7 +287,7 @@ constexpr int kDecodeBatchSplit = 4;
 Status decode_archive_attempt(std::span<const std::uint8_t> archive, const FileHeader& h,
                               const QuantMatrix& qm, const ModelSet& ms,
                               std::uint32_t attempt_max_nz, std::span<std::uint8_t> out,
-                              bool& overflowed) {
+                              bool& overflowed, float deblock_rms, float deblock_strength) {
   overflowed = false;
   if (!available()) return Status::backend_unavailable;
   if (h.flags & detail::kFlagCorrections) return Status::backend_unavailable;
@@ -444,7 +445,7 @@ Status decode_archive_attempt(std::span<const std::uint8_t> archive, const FileH
       cudaMalloc(&d_counts, batch * kChunksPerBrick * 4) != cudaSuccess ||
       (!direct && cudaMalloc(&d_out, batch * brick_vox * esz) != cudaSuccess) ||
       cudaMalloc(&d_descs, batch * sizeof(BrickDesc)) != cudaSuccess ||
-      cudaMalloc(&d_error, 4) != cudaSuccess ||
+      cudaMalloc(&d_error, 8) != cudaSuccess ||
       cudaMalloc(&d_tab_freq, batch * detail::kMaxBrickTables * 256 * 2) != cudaSuccess ||
       cudaMalloc(&d_tab_fc, batch * detail::kMaxBrickTables * 256 * 4) != cudaSuccess ||
       cudaMalloc(&d_tab_slot, batch * detail::kMaxBrickTables * kProbScale) != cudaSuccess ||
@@ -498,7 +499,10 @@ Status decode_archive_attempt(std::span<const std::uint8_t> archive, const FileH
   // The destination is pinned once here rather than around the final copy.
   // cudaMemcpyAsync into pageable memory is not actually asynchronous, so
   // without this the pipeline would silently degrade to the serial behaviour.
-  const bool pipelined = direct && slab_pipelined && streams_ok;
+  // Filtering needs the whole volume present, including across brick faces, so
+  // no slab can be read back until every batch has been decoded.
+  const bool will_deblock = direct && deblock_strength > 0.0f && deblock_rms > 0.0f;
+  const bool pipelined = direct && slab_pipelined && streams_ok && !will_deblock;
   if (pipelined) {
     prefault(out.data(), volume_bytes);
     out_registered =
@@ -567,9 +571,26 @@ Status decode_archive_attempt(std::span<const std::uint8_t> archive, const FileH
             kBrickDim;
       }
     }
+    // Every one of these goes on `ks`, not the null stream, and that is load
+    // bearing rather than tidiness.
+    //
+    // `s_compute` is created non-blocking, so the null stream no longer
+    // implicitly synchronizes with it. A plain cudaMemcpy of pageable host
+    // memory is host-blocking only up to the driver's staging buffer: the DMA
+    // into device memory is still in flight when the call returns, and its
+    // ordering against a kernel is carried by the stream it was issued on.
+    // Issued on the null stream, nothing ordered that DMA before K1 read the
+    // tables, so K1 could decode a brick against another batch's frequency
+    // tables and walk off the end of the stream. It reproduced as
+    // `corrupt_bitstream` on the *second* batch of any real volume -- synthetic
+    // test data never hit it because uniform statistics make every brick decline
+    // per-brick tables, leaving nothing for the race to corrupt.
+    //
+    // cudaMemsetAsync for the same reason: cudaMemset is asynchronous with
+    // respect to the host and lands on the null stream.
     if (direct &&
         cudaMemcpy(d_origins, origins.data(), n * 3 * sizeof(std::uint32_t),
-                   cudaMemcpyHostToDevice) != cudaSuccess) {
+                        cudaMemcpyHostToDevice) != cudaSuccess) {
       cleanup();
       return Status::io_error;
     }
@@ -578,7 +599,7 @@ Status decode_archive_attempt(std::span<const std::uint8_t> archive, const FileH
     const std::uint32_t ntab = static_cast<std::uint32_t>(tab_freq.size() / 256);
     if (ntab > 0) {
       if (cudaMemcpy(d_tab_freq, tab_freq.data(), tab_freq.size() * 2,
-                     cudaMemcpyHostToDevice) != cudaSuccess) {
+                          cudaMemcpyHostToDevice) != cudaSuccess) {
         cleanup();
         return Status::io_error;
       }
@@ -590,9 +611,8 @@ Status decode_archive_attempt(std::span<const std::uint8_t> archive, const FileH
             cudaSuccess ||
         cudaMemcpy(d_tab_count, tab_count.data(), n * 4, cudaMemcpyHostToDevice) !=
             cudaSuccess ||
-        cudaMemcpy(d_descs, descs.data(), n * sizeof(BrickDesc), cudaMemcpyHostToDevice) !=
-            cudaSuccess ||
-        cudaMemset(d_error, 0, 4) != cudaSuccess ||
+        cudaMemcpy(d_descs, descs.data(), n * sizeof(BrickDesc), cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemset(d_error, 0, 8) != cudaSuccess ||
         cudaMemset(d_counts, 0, static_cast<std::size_t>(n) * kChunksPerBrick * 4) !=
             cudaSuccess) {
       cleanup();
@@ -700,8 +720,14 @@ Status decode_archive_attempt(std::span<const std::uint8_t> archive, const FileH
       cleanup();
       return Status::io_error;
     }
-    std::uint32_t err = 0;
-    cudaMemcpy(&err, d_error, 4, cudaMemcpyDeviceToHost);
+    std::uint32_t err2[2] = {0, 0};
+    cudaMemcpy(err2, d_error, 8, cudaMemcpyDeviceToHost);
+    const std::uint32_t err = err2[0];
+    if (profile && err)
+      std::fprintf(stderr,
+                   "[cuda] k1 error %u at b0=%llu n=%u max_nz=%u why=%u brick=%u chunk=%u\n", err,
+                   static_cast<unsigned long long>(b0), n, max_nz, (err2[1] >> 4) & 15u,
+                   (err2[1] >> 8) & 4095u, err2[1] >> 20);
     if (err == kErrOverflow) {
       overflowed = true;
       cleanup();
@@ -775,6 +801,77 @@ Status decode_archive_attempt(std::span<const std::uint8_t> archive, const FileH
     }
   }
 
+  // Deblock in place, before anything is read back.
+  if (will_deblock) {
+    double* d_acc = nullptr;
+    unsigned long long* d_cnt = nullptr;
+    if (cudaMalloc(&d_acc, sizeof(double)) != cudaSuccess ||
+        cudaMalloc(&d_cnt, sizeof(unsigned long long)) != cudaSuccess) {
+      cudaFree(d_acc);
+      cudaFree(d_cnt);
+      cleanup();
+      return Status::out_of_memory;
+    }
+    const float lo = dtype_min(h.dtype), hi = dtype_max(h.dtype);
+    bool failed = false;
+    for (int ax = 0; ax < 3 && !failed; ++ax) {
+      cudaMemset(d_acc, 0, sizeof(double));
+      cudaMemset(d_cnt, 0, sizeof(unsigned long long));
+      switch (h.dtype) {
+#define GPUDCT_ACT(TY, T)                                                                     \
+  case DType::TY:                                                                             \
+    k3_activity<T><<<256, 128>>>(reinterpret_cast<const T*>(d_volume), h.dims.x, h.dims.y,     \
+                                 h.dims.z, ax, h.data_scale, h.data_offset, d_acc, d_cnt);     \
+    break;
+        GPUDCT_ACT(u8, std::uint8_t)
+        GPUDCT_ACT(s8, std::int8_t)
+        GPUDCT_ACT(u16, std::uint16_t)
+        GPUDCT_ACT(s16, std::int16_t)
+        GPUDCT_ACT(u32, std::uint32_t)
+        GPUDCT_ACT(s32, std::int32_t)
+        GPUDCT_ACT(f32, float)
+#undef GPUDCT_ACT
+      }
+      double acc = 0;
+      unsigned long long cnt = 0;
+      if (cudaDeviceSynchronize() != cudaSuccess ||
+          cudaMemcpy(&acc, d_acc, sizeof(acc), cudaMemcpyDeviceToHost) != cudaSuccess ||
+          cudaMemcpy(&cnt, d_cnt, sizeof(cnt), cudaMemcpyDeviceToHost) != cudaSuccess) {
+        failed = true;
+        break;
+      }
+      // Same fallback as the host filter: a perfectly flat volume has no
+      // interior activity and nothing to protect.
+      const float activity =
+          cnt ? static_cast<float>(acc / static_cast<double>(cnt)) : deblock_rms * 3.0f;
+      const detail::DeblockThresholds th =
+          detail::deblock_thresholds(deblock_rms, activity, deblock_strength);
+      switch (h.dtype) {
+#define GPUDCT_DBL(TY, T)                                                                     \
+  case DType::TY:                                                                             \
+    k4_deblock_axis<T><<<1024, 128>>>(reinterpret_cast<T*>(d_volume), h.dims.x, h.dims.y,      \
+                                      h.dims.z, ax, h.data_scale, h.data_offset, lo, hi,       \
+                                      th.alpha, th.beta, th.clip);                             \
+    break;
+        GPUDCT_DBL(u8, std::uint8_t)
+        GPUDCT_DBL(s8, std::int8_t)
+        GPUDCT_DBL(u16, std::uint16_t)
+        GPUDCT_DBL(s16, std::int16_t)
+        GPUDCT_DBL(u32, std::uint32_t)
+        GPUDCT_DBL(s32, std::int32_t)
+        GPUDCT_DBL(f32, float)
+#undef GPUDCT_DBL
+      }
+      if (cudaDeviceSynchronize() != cudaSuccess) failed = true;
+    }
+    cudaFree(d_acc);
+    cudaFree(d_cnt);
+    if (failed) {
+      cleanup();
+      return Status::io_error;
+    }
+  }
+
   if (direct && pipelined) {
     timer.mark(timer.c);
     const cudaError_t copy = cudaStreamSynchronize(s_copy);
@@ -825,12 +922,14 @@ Status decode_archive_attempt(std::span<const std::uint8_t> archive, const FileH
 constexpr std::uint32_t kTypicalMaxNonzero = 768;
 
 Status decode_archive(std::span<const std::uint8_t> archive, const FileHeader& h,
-                      const QuantMatrix& qm, const ModelSet& ms, std::span<std::uint8_t> out) {
+                      const QuantMatrix& qm, const ModelSet& ms, std::span<std::uint8_t> out,
+                      float deblock_rms, float deblock_strength) {
   bool overflowed = false;
-  const Status s =
-      decode_archive_attempt(archive, h, qm, ms, kTypicalMaxNonzero, out, overflowed);
+  const Status s = decode_archive_attempt(archive, h, qm, ms, kTypicalMaxNonzero, out, overflowed,
+                                          deblock_rms, deblock_strength);
   if (!overflowed) return s;
-  return decode_archive_attempt(archive, h, qm, ms, kChunkVox, out, overflowed);
+  return decode_archive_attempt(archive, h, qm, ms, kChunkVox, out, overflowed, deblock_rms,
+                                deblock_strength);
 }
 
 

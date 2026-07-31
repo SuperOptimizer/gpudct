@@ -165,6 +165,7 @@ struct Decoder {
   std::uint32_t* state;
   std::uint32_t stride;
   bool failed;
+  std::uint32_t why;
 
   __device__ bool init(const std::uint8_t* b, std::uint32_t n, std::uint32_t* state_pool,
                        std::uint32_t state_stride) {
@@ -177,6 +178,7 @@ struct Decoder {
     pos = 0;
     next = 0;
     failed = false;
+    why = 0;
     state = state_pool;
     stride = state_stride;
     if (n < kRansStates * 4) return false;
@@ -214,6 +216,7 @@ struct Decoder {
     while (x < kRansL) {
       if (pos >= size) {
         failed = true;
+        why = 3;
         return 0;
       }
       x = (x << 8) | bytes[pos++];
@@ -238,6 +241,7 @@ struct Decoder {
     while (x < kRansL) {
       if (pos >= size) {
         failed = true;
+        why = 4;
         return 0;
       }
       x = (x << 8) | bytes[pos++];
@@ -385,8 +389,10 @@ __device__ void k1_decode_stream(Decoder& d, const DeviceModels& models, std::ui
                                  std::uint32_t* __restrict out_counts,
                                  std::uint32_t max_nonzero_per_chunk,
                                  std::uint32_t* __restrict error_flag) {
+  std::uint32_t last_ci = 0;
   for (int ci = static_cast<int>(s); ci < kChunksPerBrick;
        ci += static_cast<int>(streams)) {
+    last_ci = static_cast<std::uint32_t>(ci);
     const std::size_t chunk_slot =
         (static_cast<std::size_t>(b) * kChunksPerBrick + ci) * max_nonzero_per_chunk;
     std::uint32_t n = 0;
@@ -429,8 +435,8 @@ __device__ void k1_decode_stream(Decoder& d, const DeviceModels& models, std::ui
         int mag;
         if (idx == 0) {
           std::uint32_t m32 = 0;
-          if (!read_len_mag(d, models, MI::dc_len, m32)) break;
-          if (static_cast<std::int32_t>(m32) > max_level) { d.failed = true; break; }
+          if (!read_len_mag(d, models, MI::dc_len, m32)) { if (!d.why) d.why = 5; break; }
+          if (static_cast<std::int32_t>(m32) > max_level) { d.failed = true; d.why = 6; break; }
           mag = static_cast<int>(m32);
         } else {
           const int bu = bit & 3, bv = (bit >> 2) & 3, bw = (bit >> 4) & 3;
@@ -444,9 +450,9 @@ __device__ void k1_decode_stream(Decoder& d, const DeviceModels& models, std::ui
             mag = static_cast<int>(v) + 1;
           } else {
             std::uint32_t extra = 0;
-            if (!read_len_mag(d, models, MI::esc_len, extra)) break;
+            if (!read_len_mag(d, models, MI::esc_len, extra)) { if (!d.why) d.why = 7; break; }
             mag = static_cast<int>(extra) + 15;
-            if (mag > max_level) { d.failed = true; break; }
+            if (mag > max_level) { d.failed = true; d.why = 8; break; }
           }
         }
         const std::uint32_t sign = d.decode_bypass(models);
@@ -463,6 +469,7 @@ __device__ void k1_decode_stream(Decoder& d, const DeviceModels& models, std::ui
           // it must be distinguishable from a corrupt stream.
           atomicExch(error_flag, 2u);
           d.failed = true;
+          d.why = 9;
           break;
         }
         nb[bit] = mag;
@@ -472,7 +479,10 @@ __device__ void k1_decode_stream(Decoder& d, const DeviceModels& models, std::ui
   }
 
   // Do not clobber an overflow report with a generic failure.
-  if (d.failed) atomicCAS(error_flag, 0u, 1u);
+  if (d.failed) {
+    atomicCAS(error_flag, 0u, 1u);
+    atomicCAS(error_flag + 1, 0u, 16u | (d.why << 4) | (b << 8) | (last_ci << 20));
+  }
 }
 
 __global__ void k1_entropy_decode(const BrickDesc* __restrict bricks,
@@ -799,6 +809,132 @@ __global__ void k2_inverse_transform_direct(const std::int16_t* __restrict level
       const float c = fminf(fmaxf(w, lo), hi);
       volume[o] = static_cast<T>(__float2int_rn(c));
     }
+  }
+}
+
+// --------------------------------------------------------------------------
+// Chunk-boundary deblocking on the device (docs/DESIGN.md 3.8)
+//
+// The filter used to run host-side on the decoded volume, which on the CUDA
+// path meant reading a gigabyte back and then walking it on the CPU: measured,
+// that cost 2.8x the entire GPU decode. In direct mode the volume is already
+// here, and every part of the filter is trivially parallel -- boundary planes
+// are 16 voxels apart and the filter reads at most two voxels either side, so
+// no two planes on an axis interact.
+//
+// The axis order is fixed and is part of the reconstruction, so the three
+// passes are three launches rather than one.
+// --------------------------------------------------------------------------
+
+template <class T>
+__device__ inline float db_get(const T* __restrict v, std::size_t o, float scale, float offset) {
+  return static_cast<float>(v[o]) * scale + offset;
+}
+
+template <class T>
+__device__ inline void db_set(T* __restrict v, std::size_t o, float w, float inv_scale,
+                              float offset, float lo, float hi) {
+  const float s = (w - offset) * inv_scale;
+  if constexpr (sizeof(T) == 4 && !std::is_integral<T>::value) {
+    v[o] = s;
+  } else {
+    v[o] = static_cast<T>(__float2int_rn(fminf(fmaxf(s, lo), hi)));
+  }
+}
+
+__device__ inline std::size_t db_index(std::uint32_t x, std::uint32_t y, std::uint32_t z,
+                                       std::uint32_t dx, std::uint32_t dy) {
+  return (static_cast<std::size_t>(z) * dy + y) * dx + x;
+}
+
+// Mean |first difference| along `ax` over interior steps, on a stride-16 lattice
+// of lines. Mirrors the host implementation, including the stride: the estimate
+// feeds the filter thresholds, so the two paths have to agree.
+template <class T>
+__global__ void k3_activity(const T* __restrict volume, std::uint32_t dx, std::uint32_t dy,
+                            std::uint32_t dz, int ax, float scale, float offset,
+                            double* __restrict acc, unsigned long long* __restrict cnt) {
+  const std::uint32_t lim[3] = {dx, dy, dz};
+  const int a1 = (ax + 1) % 3, a2 = (ax + 2) % 3;
+  const std::uint32_t stride = 16;
+  const std::uint32_t n1 = (lim[a1] + stride - 1) / stride;
+  const std::uint32_t n2 = (lim[a2] + stride - 1) / stride;
+  const std::uint64_t total = static_cast<std::uint64_t>(n1) * n2;
+
+  double local = 0.0;
+  unsigned long long local_n = 0;
+  for (std::uint64_t t = blockIdx.x * blockDim.x + threadIdx.x; t < total;
+       t += static_cast<std::uint64_t>(gridDim.x) * blockDim.x) {
+    std::uint32_t c[3] = {0, 0, 0};
+    c[a1] = static_cast<std::uint32_t>(t / n2) * stride;
+    c[a2] = static_cast<std::uint32_t>(t % n2) * stride;
+
+    float prev = 0.0f;
+    for (std::uint32_t k = 0; k < lim[ax]; ++k) {
+      std::uint32_t q[3] = {c[0], c[1], c[2]};
+      q[ax] = k;
+      const float cur = db_get(volume, db_index(q[0], q[1], q[2], dx, dy), scale, offset);
+      if (k > 0 && (k - 1) % 16 != 15) {
+        local += fabsf(cur - prev);
+        ++local_n;
+      }
+      prev = cur;
+    }
+  }
+  if (local_n) {
+    atomicAdd(acc, local);
+    atomicAdd(cnt, local_n);
+  }
+}
+
+// One axis pass. `alpha`, `beta` and `clip` are the host-derived thresholds.
+template <class T>
+__global__ void k4_deblock_axis(T* __restrict volume, std::uint32_t dx, std::uint32_t dy,
+                                std::uint32_t dz, int ax, float scale, float offset, float lo,
+                                float hi, float alpha, float beta, float clip) {
+  const std::uint32_t lim[3] = {dx, dy, dz};
+  if (lim[ax] < 4) return;
+  const std::uint32_t planes = (lim[ax] - 1) / 16;
+  if (planes == 0) return;
+
+  const int a1 = (ax + 1) % 3, a2 = (ax + 2) % 3;
+  const std::uint64_t per_plane = static_cast<std::uint64_t>(lim[a1]) * lim[a2];
+  const std::uint64_t total = per_plane * planes;
+  const float inv_scale = 1.0f / scale;
+
+  for (std::uint64_t t = blockIdx.x * blockDim.x + threadIdx.x; t < total;
+       t += static_cast<std::uint64_t>(gridDim.x) * blockDim.x) {
+    const std::uint32_t pi = static_cast<std::uint32_t>(t / per_plane);
+    const std::uint64_t r = t % per_plane;
+    const std::uint32_t b = (pi + 1) * 16;
+    if (b < 2 || b + 1 >= lim[ax]) continue;
+
+    std::uint32_t c[3] = {0, 0, 0};
+    c[a1] = static_cast<std::uint32_t>(r / lim[a2]);
+    c[a2] = static_cast<std::uint32_t>(r % lim[a2]);
+
+    std::size_t off[4];
+    for (int j = 0; j < 4; ++j) {
+      std::uint32_t q[3] = {c[0], c[1], c[2]};
+      q[ax] = b - 2 + static_cast<std::uint32_t>(j);
+      off[j] = db_index(q[0], q[1], q[2], dx, dy);
+    }
+    const float p1 = db_get(volume, off[0], scale, offset);
+    float p0 = db_get(volume, off[1], scale, offset);
+    float q0 = db_get(volume, off[2], scale, offset);
+    const float q1 = db_get(volume, off[3], scale, offset);
+
+    const float d = q0 - p0;
+    if (fabsf(d) >= alpha) continue;
+    if (fabsf(p1 - p0) >= beta) continue;
+    if (fabsf(q1 - q0) >= beta) continue;
+
+    float delta = (4.0f * d + (p1 - q1)) * 0.125f;
+    delta = fminf(fmaxf(delta, -clip), clip);
+    p0 += delta;
+    q0 -= delta;
+    db_set(volume, off[1], p0, inv_scale, offset, lo, hi);
+    db_set(volume, off[2], q0, inv_scale, offset, lo, hi);
   }
 }
 

@@ -1347,14 +1347,15 @@ Status decode_into(std::span<const std::uint8_t> archive, const DecodeOptions& o
   // exactly (raw bricks, correction layers) and we fall through to the CPU,
   // which is always correct, rather than returning a partial answer.
   if (backend == Backend::cuda && cuda::available()) {
-    const Status cs = cuda::decode_archive(archive, h, qm, ms, out);
-    if (cs == Status::ok) {
-      if (opts.deblock && opts.deblock_strength > 0.0f &&
-          (h.flags & detail::kFlagCorrections) == 0)
-        deblock_volume(out.data(), h.dims, h.dtype, h.data_scale, h.data_offset,
-                       expected_voxel_rms(qm), opts.deblock_strength, opts.threads);
-      return Status::ok;
-    }
+    // Ask the device to filter while the volume is still in its memory. Doing
+    // it host-side after readback measured 2.8x the cost of the whole GPU
+    // decode.
+    const bool want_deblock = opts.deblock && opts.deblock_strength > 0.0f &&
+                              (h.flags & detail::kFlagCorrections) == 0;
+    const Status cs =
+        cuda::decode_archive(archive, h, qm, ms, out, want_deblock ? expected_voxel_rms(qm) : 0.0f,
+                             want_deblock ? opts.deblock_strength : 0.0f);
+    if (cs == Status::ok) return Status::ok;
     if (cs != Status::backend_unavailable) return cs;
   }
 #endif

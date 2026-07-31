@@ -47,9 +47,16 @@ void device_free(void* p);
 [[nodiscard]] Status device_volume_decode(DeviceVolumeImpl* v,
                                           std::span<const std::uint32_t> indices, void* d_out);
 
+// `deblock_rms` is the quantizer's predicted voxel RMS; the device combines it
+// with an activity statistic it measures itself, exactly as the host filter
+// does. Pass strength <= 0 to skip filtering. When filtering, the whole volume
+// must be reconstructed before any of it is read back, so this also disables
+// the pipelined readback -- worth roughly 5-8%, against the 2.8x the host-side
+// filter was costing.
 [[nodiscard]] Status decode_archive(std::span<const std::uint8_t> archive,
                                     const detail::FileHeader& h, const detail::QuantMatrix& qm,
-                                    const detail::ModelSet& ms, std::span<std::uint8_t> out);
+                                    const detail::ModelSet& ms, std::span<std::uint8_t> out,
+                                    float deblock_rms = 0.0f, float deblock_strength = 0.0f);
 
 // Encodes every brick of a volume on the GPU, filling `payloads` in brick-index
 // order. The caller assembles the header and index around them.
