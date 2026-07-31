@@ -68,3 +68,6 @@ tests/data/corpus/
 # Python bytecode from the bench scripts
 __pycache__/
 *.pyc
+
+# Agent worktrees and local tooling state.
+.claude/
