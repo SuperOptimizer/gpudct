@@ -377,8 +377,35 @@ TEST(encode_rejects_bad_arguments) {
   EncodeOptions opts;
   CHECK(encode(nullptr, v.dims, DType::u8, opts, archive) == Status::invalid_argument);
   CHECK(encode(raw.data(), Dims{0, 8, 8}, DType::u8, opts, archive) == Status::invalid_argument);
+  // 0 is not an error: it is the default, and means the encoder picks P itself.
   opts.streams_per_brick = 0;
+  CHECK(encode(raw.data(), v.dims, DType::u8, opts, archive) == Status::ok);
+  opts.streams_per_brick = 65;  // above the format's ceiling
   CHECK(encode(raw.data(), v.dims, DType::u8, opts, archive) == Status::invalid_argument);
+}
+
+// What the encoder picks for P must be a property of the archive, not of the
+// machine that made it -- the probe runs under parallel_for like everything
+// else, and a sample whose size depended on the thread count would make the
+// bytes depend on it too.
+TEST(automatic_stream_count_is_deterministic) {
+  const Volume v = scroll_like_volume({256, 192, 160});
+  const std::vector<std::uint8_t> raw = to_typed(v, DType::u8);
+  std::vector<std::uint8_t> prev;
+  for (int t : {1, 2, 4, 8}) {
+    EncodeOptions opts;
+    opts.streams_per_brick = 0;
+    opts.threads = t;
+    std::vector<std::uint8_t> archive;
+    REQUIRE(encode(raw.data(), v.dims, DType::u8, opts, archive) == Status::ok);
+    if (!prev.empty()) CHECK(archive == prev);
+    prev = std::move(archive);
+  }
+  // And it must land inside the format's range whatever it chose.
+  VolumeInfo info;
+  REQUIRE(inspect(prev, info) == Status::ok);
+  CHECK(info.streams_per_brick >= 1);
+  CHECK(info.streams_per_brick <= 64);
 }
 
 // Pure noise is incompressible. The raw-brick fallback means the codec must

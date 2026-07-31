@@ -384,6 +384,31 @@ void deblock_volume(void* data, Dims dims, DType t, float scale, float offset, f
 inline constexpr std::uint8_t kBrickCoded = 0;  // rANS streams
 inline constexpr std::uint8_t kBrickRaw = 1;    // verbatim voxels, see encode_brick
 
+// Automatic streams-per-brick selection. See the derivation at its use site in
+// encode(); these are the four numbers it needs.
+//
+// The probe value is the historical default, so an archive whose bricks are too
+// small to afford more streams comes out byte-for-byte as it always did, and the
+// automatic path can only ever raise P. 64 is the format's ceiling.
+inline constexpr std::uint32_t kStreamProbeP = 16;
+inline constexpr std::uint32_t kStreamMaxAuto = 64;
+// The probe is real encode work on top of the encode, so it is kept small. Four
+// stratified bricks cost ~6% of encode on a 512-brick volume and ~25% on a
+// 64-brick one, and the accuracy they buy is ample: the decision has three
+// outcomes with thresholds at 82 KB and 247 KB of mean payload, so only a
+// measurement that lands within about 10% of a threshold can be swung by
+// sampling noise -- and there both answers are within a rounding of the budget.
+inline constexpr std::uint64_t kStreamProbeBricks = 4;
+// Bytes a brick pays per stream regardless of content: a 16-byte rANS flush
+// (kRansStates 32-bit states) plus its 4-byte entry in the brick's size table.
+// Measured at 18 rather than 20; the missing two are recovered because shorter
+// streams renormalize slightly less.
+inline constexpr double kStreamFlushBytes = 18.0;
+// Share of a brick's payload the extra streams may consume. 0.35% keeps every
+// case measured at or below 0.32% realized while still reaching P=64 wherever
+// the rate can pay for it.
+inline constexpr double kStreamOverheadBudget = 0.0035;
+
 // The part of a brick that actually lies inside the volume. Edge bricks are
 // mostly padding, and storing padding would defeat the raw fallback entirely.
 [[nodiscard]] Dims brick_valid_extent(Dims dims, std::uint32_t bx, std::uint32_t by,
@@ -1113,19 +1138,19 @@ Status inspect(std::span<const std::uint8_t> archive, VolumeInfo& out) {
 Status encode(const void* data, Dims dims, DType dtype, const EncodeOptions& opts,
               std::vector<std::uint8_t>& out, Backend backend) {
   if (data == nullptr || dims.empty()) return Status::invalid_argument;
-  if (opts.streams_per_brick == 0 || opts.streams_per_brick > 64)
-    return Status::invalid_argument;
+  if (opts.streams_per_brick > 64) return Status::invalid_argument;
   if (backend != Backend::automatic && backend != Backend::cpu_scalar)
     if (!backend_available(backend)) return Status::backend_unavailable;
 
   Geometry geo{dims, brick_grid(dims)};
-  const std::uint32_t P = opts.streams_per_brick;
+  // 0 means "choose one"; the choice needs the quantizer and the models, so it
+  // happens further down, just before the bricks are encoded.
+  std::uint32_t P = opts.streams_per_brick ? opts.streams_per_brick : kStreamProbeP;
 
   detail::FileHeader h;
   h.dims = dims;
   h.dtype = dtype;
   h.profile = opts.profile;
-  h.streams_per_brick = static_cast<std::uint8_t>(P);
   h.brick_count = geo.brick_count();
 
   QuantParams qp = QuantParams::for_profile(opts.profile, opts.quality);
@@ -1240,6 +1265,73 @@ Status encode(const void* data, Dims dims, DType dtype, const EncodeOptions& opt
   }
 
   if (bounds.active()) h.flags |= detail::kFlagCorrections;
+
+  // Choose the stream count, unless the caller pinned one.
+  //
+  // P is the archive's only real decode-parallelism knob: the GPU entropy kernel
+  // runs one thread per (brick, stream), so a 64-brick volume at P=16 gives it
+  // 1024 threads and nothing to hide latency behind. Measured on 512^3 scroll at
+  // q=1, raising P from 16 to 64 cut the entropy kernel from 498 ms to 107 ms --
+  // 4.65x, and the kernel is 92% of GPU decode.
+  //
+  // It is not free, and the cost has an exact closed form. Each stream ends with
+  // a 16-byte rANS flush and a 4-byte size in the brick header, so a brick pays
+  // 18 bytes per stream (20 gross, less a couple recovered by shorter streams)
+  // whatever it contains. Measured across two volumes and three qualities the
+  // absolute cost of 16 -> 64 was 864 bytes per brick every time -- identical to
+  // the byte -- which is why the same change is +0.21% on a dense archive and
+  // +2.84% on a sparse one. The overhead is fixed; only the denominator moves.
+  //
+  // So the rule is a budget, not a constant: probe a sample of bricks to learn
+  // the mean payload, then take the largest P whose extra bytes stay under
+  // kStreamOverheadBudget of it. Because the cost is exactly linear in P, that
+  // needs no second encode -- the probe measures the P=kStreamProbeP payload and
+  // the model gives the rest. Sampling is stratified across the volume, since
+  // bricks vary enormously between masked-out air and dense fibre.
+  //
+  // Measured outcome across the six volume/quality pairs used to set the budget:
+  // P lands on 64 or 32 in five of them, every realized cost is at or below
+  // 0.32%, and the one case that stays at 16 is the one where raising it would
+  // have cost 1% to save 28 ms.
+  if (opts.streams_per_brick == 0 && h.brick_count > 0) {
+    const std::uint64_t nprobe = std::min<std::uint64_t>(h.brick_count, kStreamProbeBricks);
+    std::vector<std::size_t> sizes(static_cast<std::size_t>(nprobe));
+    parallel_for(nprobe, opts.threads, [&](std::uint64_t k) {
+      // Low-discrepancy rather than evenly spaced. Bricks are indexed x fastest,
+      // so striding by brick_count/nprobe lands on the same (x, y) column in
+      // every z layer -- and on a scroll that column is either always air or
+      // always dense, which is exactly the wrong sample. The golden-ratio
+      // sequence spreads the picks across all three axes instead. Measured: even
+      // spacing put a 120 KB mean at 16, the sequence puts it at 32.
+      const std::uint64_t i =
+          h.brick_count == nprobe
+              ? k
+              : static_cast<std::uint64_t>(static_cast<double>(h.brick_count) *
+                                           std::fmod((static_cast<double>(k) + 0.5) *
+                                                         0.6180339887498949,
+                                                     1.0)) %
+                    h.brick_count;
+      std::uint32_t bx, by, bz;
+      geo.brick_coords(i, bx, by, bz);
+      sizes[static_cast<std::size_t>(k)] =
+          encode_brick(data, dims, dtype, h.data_scale, h.data_offset, qm, qp.deadzone, ms,
+                       kStreamProbeP, bx, by, bz, bounds, nullptr, ops,
+                       opts.effort == Effort::high, opts.per_brick_tables)
+              .size();
+    });
+    double mean = 0;
+    for (std::size_t s : sizes) mean += static_cast<double>(s);
+    mean /= static_cast<double>(nprobe);
+
+    for (std::uint32_t cand = kStreamMaxAuto; cand > kStreamProbeP; cand >>= 1) {
+      const double extra = static_cast<double>(cand - kStreamProbeP) * kStreamFlushBytes;
+      if (mean > 0.0 && extra <= kStreamOverheadBudget * mean) {
+        P = cand;
+        break;
+      }
+    }
+  }
+  h.streams_per_brick = static_cast<std::uint8_t>(P);
 
   // Encode every brick independently, then lay them out. Bricks are compressed
   // in parallel and assembled in order, so output bytes never depend on thread

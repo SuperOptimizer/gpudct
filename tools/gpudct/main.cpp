@@ -39,7 +39,10 @@ compression options:
   --profile P      archival | balanced | viewing      (default balanced)
   --quality Q      higher is finer; scales the quantizer (default 1.0)
   --effort E       fast | normal | high               (default normal)
-  --streams N      rANS streams per brick, 1..64      (default 16)
+  --streams N      rANS streams per brick, 1..64. 0 lets the encoder pick,
+                   which is the default: more streams decode faster on the GPU
+                   but cost a fixed 18 bytes each per brick, so it spends up to
+                   0.35%% of the measured payload on them
   --threads N      0 = hardware concurrency           (default 0)
   --backend B      auto | cpu-scalar | cpu-simd | cuda
   --deadzone D     dead-zone width as a fraction of a step (default 0.34)

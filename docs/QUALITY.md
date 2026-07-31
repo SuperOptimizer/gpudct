@@ -1077,3 +1077,107 @@ on overflow -- which the buffers being persistent makes cheap -- brought it to
 
 That number is the one to quote: a 100 GB scroll at 13x holds ~7.7 GB of
 compressed archive in VRAM plus ~50 MiB of decode scratch.
+
+### `streams_per_brick` is a budget, not a constant
+
+The section above moved the default from 4 to 16 and left it there, on the basis
+that P costs ratio and buys parallelism. Both halves of that are right; what was
+missing is that the exchange rate is not a constant, and a fixed default is
+therefore wrong on most archives.
+
+The GPU entropy kernel runs one thread per (brick, stream). A 512^3 volume is 64
+bricks, so at P=16 the whole kernel is 1024 threads -- and it is 92% of GPU
+decode time, with the inverse transform at 1.8 ms and everything else in the
+noise. Raising P is the only lever on it that does not change the format.
+
+Measured on 512^3 scroll, decode-side, entropy kernel only:
+
+| P | q=1 archive | k1 (entropy) |
+|---|---|---|
+| 8 | 26,000,587 | 1031.8 ms |
+| 16 | 26,009,787 | 498.1 ms |
+| 32 | 26,028,144 | 171.6 ms |
+| 64 | 26,065,081 | **107.0 ms** |
+
+4.65x for +0.213%. But run the same sweep on a sparser archive and the second
+column behaves completely differently:
+
+| volume, quality | mean brick payload | 16 -> 64 size | 16 -> 64 bytes |
+|---|---|---|---|
+| scroll512 q=4 | 819 KB | +0.106% | +864 B/brick |
+| scroll512 q=1 | 406 KB | +0.213% | +864 B/brick |
+| scroll512 q=0.25 | 120 KB | +0.718% | +864 B/brick |
+| scrollL0 q=4 | 269 KB | +0.321% | +864 B/brick |
+| scrollL0 q=1 | 96 KB | +0.901% | +864 B/brick |
+| scrollL0 q=0.25 | 30 KB | **+2.844%** | +864 B/brick |
+
+The last column is the whole story. The absolute cost is **identical to the
+byte** across a 27x span of archive size, because a stream's cost is fixed and
+has nothing to do with what it carries: a 16-byte rANS flush (`kRansStates`
+32-bit states) plus a 4-byte entry in the brick's size table. 864 bytes is
+48 extra streams at 18 bytes -- 20 gross, less two recovered because shorter
+streams renormalize slightly less. Only the denominator moves.
+
+So the same change is a bargain at 1835 ms saved per percent of ratio on dense
+data and a bad deal at 12 ms per percent on sparse data, and no single default
+can be right for both. `streams_per_brick = 0`, now the default, makes the
+encoder decide: probe four bricks, measure the mean payload, and take the largest
+P whose extra bytes stay under 0.35% of it. Because the cost is exactly linear in
+P, the probe needs no second encode -- it measures the payload at P=16 and the
+model supplies the rest.
+
+What it chooses, against the ground truth above:
+
+| volume, quality | chosen P | realized cost | entropy kernel |
+|---|---|---|---|
+| scroll512 q=4 | 64 | +0.106% | 153.9 ms |
+| scroll512 q=1 | 64 | +0.213% | 498 -> **106.4 ms** |
+| scroll512 q=0.25 | 32 | +0.239% | 69.9 ms |
+| scrollL0 q=4 | 64 | +0.321% | 61.4 ms |
+| scrollL0 q=1 | 32 | +0.300% | 105 -> **35.6 ms** |
+| scrollL0 q=0.25 | 16 | 0 | 41.9 ms |
+
+Every realized cost is at or below 0.32%, P reaches 32 or 64 in five of six, and
+the one case left at 16 is the one where raising it would have spent 0.95% to
+save 28 ms. The floor is the old default, so the automatic path can only ever
+raise P; an archive whose bricks cannot afford more streams comes out exactly as
+it always did.
+
+Two things the probe had to get right. It must not depend on the thread count,
+or the archive would depend on the machine that wrote it -- so the sample size is
+a constant, not a function of hardware concurrency, and `parallel_for` runs it
+like any other pass. And it must not sample evenly: bricks are indexed x fastest,
+so striding by `brick_count / nprobe` lands on the same (x, y) column in every z
+layer, which on a cylindrical scroll is either always air or always dense.
+Evenly spaced picks put the 120 KB case at P=16; a golden-ratio sequence, which
+spreads across all three axes, puts it at 32 where it belongs.
+
+The cost is encode time, and it is a whole extra round of brick encodes: +6% on a
+512-brick volume, +37% on a 64-brick one, where four bricks is a small fraction
+of the work but still a full round of latency on a many-core machine. A volume is
+encoded once and decoded many times, and `--streams N` opts out entirely.
+
+### GPU decode is slower than CPU decode, and that is not the point
+
+Worth recording plainly, because the numbers invite the wrong conclusion. On
+512^3 scroll at q=1, end to end:
+
+| | decode |
+|---|---|
+| CPU (SIMD, all cores) | 0.13 s |
+| CUDA, P=16 | 0.60 s |
+| CUDA, P=64 | 0.23 s |
+
+Even after 4.65x on the entropy kernel the GPU does not win on throughput. It
+should not be expected to: rANS decoding is a serial byte-at-a-time walk with a
+data-dependent table lookup per symbol, which is close to the worst possible
+shape for a GPU and close to the best for an out-of-order core with a large
+cache. Parallelism across streams is the only thing the device has, and the
+format caps it at `bricks * P`.
+
+What the CUDA path is for is decoding *into VRAM* without a PCIe round trip --
+`DeviceVolume`, where the archive stays resident and the decoded voxels are
+already where the renderer wants them -- and freeing the CPU while it happens.
+Measured against those goals it is worth having. Measured as a throughput
+accelerator it is not, and no amount of kernel tuning changes that; it would take
+a different entropy layer.

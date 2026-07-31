@@ -209,7 +209,16 @@ struct EncodeOptions {
   // against +13% GPU decode and 1.45x cheaper random chunk access, with CPU
   // decode unchanged. A volume is encoded once and read many times, so 16 is the
   // better default; drop to 4 if archive size is the only thing that matters.
-  std::uint8_t streams_per_brick = 16;
+  //
+  // 0 means the encoder picks, which is the default. It cannot be picked from
+  // the settings alone: the cost of a stream is a fixed 18 bytes per brick, so
+  // what P is affordable depends entirely on how large the bricks turn out --
+  // the same 16 -> 64 change is +0.21% on a dense archive and +2.84% on a sparse
+  // one. The encoder probes a sample of bricks and spends up to 0.35% of the
+  // measured payload on extra streams, which reaches P=64 (4.65x faster GPU
+  // entropy decode) wherever the rate can pay for it and stays at 16 where it
+  // cannot. Pin a value to reproduce an exact archive or to override the budget.
+  std::uint8_t streams_per_brick = 0;
   int threads = 0;                     // 0 = hardware concurrency
 };
 
