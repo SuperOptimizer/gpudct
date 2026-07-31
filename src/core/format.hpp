@@ -3,7 +3,7 @@
 // Layout:
 //   FileHeader                       fixed size, little-endian
 //   [table blob]                     optional, only when flag_custom_tables is set
-//   BrickEntry[brick_count]          offset + size per brick
+//   BrickEntry[brick_count]          offset + size + max_nonzero per brick
 //   brick payloads                   u32 stream_size[P], then P rANS blobs
 //
 // Everything multi-byte is little-endian and read through explicit byte shuffling
@@ -58,7 +58,17 @@ struct FileHeader {
 struct BrickEntry {
   std::uint64_t offset = 0;
   std::uint32_t size = 0;
-  std::uint32_t reserved = 0;
+  // Largest nonzero-coefficient count of any single chunk in this brick, which
+  // is what the GPU decoder has to size its sparse scratch by. It occupies what
+  // was a reserved word, so 0 keeps its old meaning of "not recorded" and every
+  // archive written before this existed still decodes -- the decoder guesses and
+  // retries on overflow, as it always did. Raw-mode bricks record 0 too: they
+  // hold no coefficients at all.
+  //
+  // Not trusted. A decoder must clamp it to [1, kChunkVox] and treat anything
+  // else as unrecorded, because believing an understated value would size the
+  // scratch below what the streams then write into it.
+  std::uint32_t max_nonzero = 0;
   static constexpr std::size_t kSize = 16;
 };
 

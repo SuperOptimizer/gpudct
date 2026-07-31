@@ -300,23 +300,28 @@ __device__ __forceinline__ void emit_len_mag(EncSym* buf, int& n, int cap, std::
     emit(buf, n, cap, MI::bypass, static_cast<std::uint16_t>((mag >> i) & 1), overflow, hist);
 }
 
-// Builds one chunk's symbol sequence in coding (forward) order.
+// Builds one chunk's symbol sequence in coding (forward) order. `out_nz` gets
+// the chunk's nonzero count, which the significance scan below already computes
+// and which the index records per brick -- see detail::BrickEntry.
 __device__ int build_chunk_symbols(const std::int16_t* __restrict levels, EncSym* buf, int cap,
                                    bool& overflow, int* __restrict nb,
-                                   std::uint32_t* __restrict hist) {
+                                   std::uint32_t* __restrict hist, int& out_nz) {
   int n = 0;
 
   unsigned long long sub_mask[kSubCount];
   for (int i = 0; i < kSubCount; ++i) sub_mask[i] = 0ull;
   unsigned long long l1 = 0;
+  int nz = 0;
   for (int idx = 0; idx < kChunkVox; ++idx) {
     if (levels[idx] == 0) continue;
+    ++nz;
     const int u = idx & 15, v = (idx >> 4) & 15, w = (idx >> 8) & 15;
     const int sb = ((w >> 2) * 4 + (v >> 2)) * 4 + (u >> 2);
     const int bit = ((w & 3) * 4 + (v & 3)) * 4 + (u & 3);
     sub_mask[sb] |= (1ull << bit);
     l1 |= (1ull << sb);
   }
+  out_nz = nz;
 
   emit(buf, n, cap, MI::chunk_nonzero, static_cast<std::uint16_t>(l1 != 0 ? 1 : 0), overflow, hist);
   if (l1 == 0) return n;
@@ -379,6 +384,7 @@ __global__ void ke2a_build_symbols(const std::int16_t* __restrict levels,
                                    std::uint32_t chunk_count, EncSym* __restrict syms,
                                    int sym_capacity, std::uint32_t* __restrict counts,
                                    std::uint32_t* __restrict hist,
+                                   std::uint32_t* __restrict brick_max_nz,
                                    std::uint32_t* __restrict error_flag) {
   // The neighbour-magnitude scratch lives in shared memory. As a thread-local
   // array it is indexed by a runtime value, so it spills to local memory and
@@ -390,6 +396,7 @@ __global__ void ke2a_build_symbols(const std::int16_t* __restrict levels,
   if (chunk >= chunk_count) return;
 
   bool overflow = false;
+  int nz = 0;
   EncSym* buf = syms + static_cast<std::size_t>(chunk) * sym_capacity;
   const int n = build_chunk_symbols(levels + static_cast<std::size_t>(chunk) * kChunkVox, buf,
                                     sym_capacity, overflow, sh_nb + threadIdx.x * kSubVox,
@@ -397,13 +404,18 @@ __global__ void ke2a_build_symbols(const std::int16_t* __restrict levels,
                                         ? nullptr
                                         : hist + static_cast<std::size_t>(chunk /
                                                                           kChunksPerBrick) *
-                                                     kModelTotalDev * 256);
+                                                     kModelTotalDev * 256,
+                                    nz);
   if (overflow) {
     atomicExch(error_flag, 1u);
     counts[chunk] = 0;
     return;
   }
   counts[chunk] = static_cast<std::uint32_t>(n);
+  // One atomic per chunk, reducing to the brick's densest. The alternative --
+  // writing 512 counts per brick and reducing on the host -- would cost a
+  // readback of the whole array to learn one number per brick.
+  atomicMax(&brick_max_nz[chunk / kChunksPerBrick], static_cast<std::uint32_t>(nz));
 }
 
 // KE2b: rANS arithmetic, one thread per stream.

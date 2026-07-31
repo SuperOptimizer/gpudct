@@ -364,6 +364,87 @@ TEST(cuda_decode_is_correct_across_batch_boundaries) {
   CHECK(a.differing_fraction < 1e-4);
 }
 
+// BrickEntry::max_nonzero lets the GPU decoder size its sparse scratch exactly
+// instead of guessing 768 and retrying the whole decode on overflow. Two things
+// have to hold, and they pull in opposite directions.
+//
+// First, an archive that does not carry the field -- everything written before
+// it existed -- must still decode. Zeroing it is exactly what such an archive
+// looks like, so the test writes a real archive and zeroes the field in place.
+//
+// Second, and this is the one worth being careful about: an understated value
+// would size the scratch below what the streams then write into it, which is a
+// buffer overflow rather than a wrong picture. The decoder must not believe the
+// field. Here it is overstated and understated by construction, and in both
+// cases the output must equal what the CPU produces.
+TEST(cuda_sizes_scratch_from_the_index_without_trusting_it) {
+  if (!cuda_ready()) {
+    std::printf("       (no CUDA device; skipped)\n");
+    return;
+  }
+  // Noise at high quality, so chunks are far denser than the 768 fallback and
+  // the guess-and-retry path is genuinely exercised.
+  const Volume v = noise_volume({192, 160, 144}, 0.0f, 255.0f, 99);
+  const std::vector<std::uint8_t> raw = to_typed(v, DType::u8);
+  EncodeOptions opts;
+  opts.quality = 8.0f;
+  opts.streams_per_brick = 16;
+  std::vector<std::uint8_t> archive;
+  REQUIRE(encode(raw.data(), v.dims, DType::u8, opts, archive) == Status::ok);
+
+  DecodeOptions dopts;
+  dopts.deblock = false;
+  std::vector<std::uint8_t> want;
+  VolumeInfo info;
+  REQUIRE(decode(archive, dopts, want, info, Backend::cpu_scalar) == Status::ok);
+
+  // index_offset and brick_count sit at fixed offsets in the header; each
+  // BrickEntry is offset(8) + size(4) + max_nonzero(4). Read here rather than
+  // through src/core/format.hpp so the test depends on the format as documented
+  // rather than on the implementation it is checking.
+  auto u64_at = [&](std::size_t p) {
+    std::uint64_t x = 0;
+    for (int i = 7; i >= 0; --i) x = (x << 8) | archive[p + static_cast<std::size_t>(i)];
+    return x;
+  };
+  const std::uint64_t index_offset = u64_at(72);
+  const std::uint64_t brick_count = u64_at(80);
+  REQUIRE(brick_count > 0);
+
+  struct Case {
+    const char* name;
+    std::uint32_t value;  // 0 == leave as encoded
+  };
+  // 1 is the most understated a value can be while still being in range, and is
+  // the case that would overflow the scratch if it were believed. kChunkVox is
+  // the most overstated. Both must decode correctly.
+  for (const Case& c : {Case{"as encoded", 0u}, Case{"zeroed (old archive)", 0xffffffffu},
+                        Case{"understated", 1u}, Case{"overstated", 4096u}}) {
+    std::vector<std::uint8_t> a = archive;
+    if (c.value != 0) {
+      const std::uint32_t v32 = (c.value == 0xffffffffu) ? 0u : c.value;
+      for (std::uint64_t i = 0; i < brick_count; ++i) {
+        const std::size_t e = static_cast<std::size_t>(index_offset + i * 16) + 12;
+        a[e] = static_cast<std::uint8_t>(v32);
+        a[e + 1] = static_cast<std::uint8_t>(v32 >> 8);
+        a[e + 2] = static_cast<std::uint8_t>(v32 >> 16);
+        a[e + 3] = static_cast<std::uint8_t>(v32 >> 24);
+      }
+    }
+    std::vector<std::uint8_t> got;
+    VolumeInfo gi;
+    const Status s = decode(a, dopts, got, gi, Backend::cuda);
+    if (s != Status::ok) std::printf("       %-22s decode failed\n", c.name);
+    REQUIRE(s == Status::ok);
+    std::size_t ndiff = 0;
+    for (std::size_t i = 0; i < want.size() && i < got.size(); ++i)
+      if (want[i] != got[i]) ++ndiff;
+    if (ndiff != 0) std::printf("       %-22s %zu voxels differ from CPU\n", c.name, ndiff);
+    CHECK(got.size() == want.size());
+    CHECK(ndiff == 0);
+  }
+}
+
 TEST_MAIN()
 
 // DeviceVolume: the compressed archive stays in VRAM and decoding writes into

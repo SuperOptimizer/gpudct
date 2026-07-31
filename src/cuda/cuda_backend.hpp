@@ -61,6 +61,10 @@ void device_free(void* p);
 // Encodes every brick of a volume on the GPU, filling `payloads` in brick-index
 // order. The caller assembles the header and index around them.
 //
+// `brick_max_nz` is filled in the same order with each brick's densest chunk, for
+// detail::BrickEntry::max_nonzero. The symbol-building kernel already scans for
+// significance, so the count is a by-product rather than extra work.
+//
 // Returns Status::backend_unavailable when a chunk is too dense for the device
 // scratch or a stream slab overflows, so the caller re-encodes on the CPU rather
 // than shipping a truncated archive.
@@ -68,6 +72,7 @@ void device_free(void* p);
                                    float offset, const detail::QuantMatrix& qm, float deadzone,
                                    const detail::ModelSet& ms, std::uint32_t P, bool rdo,
                                    bool per_brick_tables,
-                                   std::vector<std::vector<std::uint8_t>>& payloads);
+                                   std::vector<std::vector<std::uint8_t>>& payloads,
+                                   std::vector<std::uint32_t>& brick_max_nz);
 
 }  // namespace gpudct::cuda

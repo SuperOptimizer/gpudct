@@ -510,7 +510,8 @@ std::vector<std::uint8_t> encode_brick(const void* data, Dims dims, DType t, flo
                                        const BoundSpec& bounds,
                                        std::vector<std::uint64_t>* err_histogram,
                                        TransformOps ops, bool rdo, bool per_brick_tables,
-                                       CountCollector* counts = nullptr) {
+                                       CountCollector* counts = nullptr,
+                                       std::uint32_t* out_max_nz = nullptr) {
   std::vector<std::vector<Sym>> streams(P);
   // Each stream carries 512/P chunks, and a dense chunk emits on the order of a
   // few thousand symbols. Reserving up front turns millions of push_backs per
@@ -520,6 +521,9 @@ std::vector<std::uint8_t> encode_brick(const void* data, Dims dims, DType t, flo
   std::vector<float> voxels(kChunkVox), coeffs(kChunkVox), recon(kChunkVox);
   std::vector<std::int32_t> levels(kChunkVox), deltas(kChunkVox);
   bool any_corrections = false;
+  // The densest chunk in the brick, recorded in the index so the GPU decoder can
+  // size its sparse scratch instead of guessing. See detail::BrickEntry.
+  std::uint32_t max_nz = 0;
 
   for (int ci = 0; ci < kChunksPerBrick; ++ci) {
     const int cx = ci % kBrickChunks;
@@ -536,6 +540,13 @@ std::vector<std::uint8_t> encode_brick(const void* data, Dims dims, DType t, flo
           quantize(coeffs[static_cast<std::size_t>(i)], qm.rq[static_cast<std::size_t>(i)],
                    deadzone);
     if (rdo) rdo_optimize(coeffs.data(), qm, ms, levels.data());
+
+    // Counted after RDO, which is what decides the final level array, and so
+    // exactly the number of (index, level) pairs a decoder will materialize.
+    std::uint32_t nz = 0;
+    for (int i = 0; i < kChunkVox; ++i)
+      nz += levels[static_cast<std::size_t>(i)] != 0 ? 1u : 0u;
+    max_nz = std::max(max_nz, nz);
 
     encode_chunk_symbols(levels.data(), 0,
                          streams[static_cast<std::size_t>(ci) % P]);
@@ -676,8 +687,10 @@ std::vector<std::uint8_t> encode_brick(const void* data, Dims dims, DType t, flo
     alt.reserve(raw.size() + 1);
     alt.push_back(kBrickRaw);
     alt.insert(alt.end(), raw.begin(), raw.end());
+    if (out_max_nz != nullptr) *out_max_nz = 0;  // no coefficients at all
     return alt;
   }
+  if (out_max_nz != nullptr) *out_max_nz = max_nz;
   return payload;
 }
 
@@ -1337,6 +1350,8 @@ Status encode(const void* data, Dims dims, DType dtype, const EncodeOptions& opt
   // in parallel and assembled in order, so output bytes never depend on thread
   // scheduling.
   std::vector<std::vector<std::uint8_t>> payloads(static_cast<std::size_t>(h.brick_count));
+  // Densest chunk per brick, written into the index. See detail::BrickEntry.
+  std::vector<std::uint32_t> brick_max_nz(static_cast<std::size_t>(h.brick_count), 0);
 
   bool encoded = false;
 #ifdef GPUDCT_HAVE_CUDA
@@ -1347,7 +1362,7 @@ Status encode(const void* data, Dims dims, DType dtype, const EncodeOptions& opt
   if (backend == Backend::cuda && cuda::available() && !bounds.active()) {
     if (cuda::encode_bricks(data, dims, dtype, h.data_scale, h.data_offset, qm, qp.deadzone,
                             ms, P, opts.effort == Effort::high, opts.per_brick_tables,
-                            payloads) == Status::ok)
+                            payloads, brick_max_nz) == Status::ok)
       encoded = true;
   }
 #endif
@@ -1359,7 +1374,8 @@ Status encode(const void* data, Dims dims, DType dtype, const EncodeOptions& opt
       payloads[static_cast<std::size_t>(i)] =
           encode_brick(data, dims, dtype, h.data_scale, h.data_offset, qm, qp.deadzone, ms, P,
                        bx, by, bz, bounds, nullptr, ops, opts.effort == Effort::high,
-                       opts.per_brick_tables);
+                       opts.per_brick_tables, nullptr,
+                       &brick_max_nz[static_cast<std::size_t>(i)]);
     });
   } else {
     // The device path does not evaluate the raw-brick fallback, so apply it
@@ -1379,6 +1395,7 @@ Status encode(const void* data, Dims dims, DType dtype, const EncodeOptions& opt
           alt.push_back(kBrickRaw);
           alt.insert(alt.end(), raw.begin(), raw.end());
           p = std::move(alt);
+          brick_max_nz[static_cast<std::size_t>(i)] = 0;  // no coefficients any more
         }
       });
     }
@@ -1396,7 +1413,7 @@ Status encode(const void* data, Dims dims, DType dtype, const EncodeOptions& opt
   for (std::uint64_t i = 0; i < h.brick_count; ++i) {
     detail::put_u64(out, cursor);
     detail::put_u32(out, static_cast<std::uint32_t>(payloads[static_cast<std::size_t>(i)].size()));
-    detail::put_u32(out, 0);
+    detail::put_u32(out, brick_max_nz[static_cast<std::size_t>(i)]);
     cursor += payloads[static_cast<std::size_t>(i)].size();
   }
   for (auto& p : payloads) {

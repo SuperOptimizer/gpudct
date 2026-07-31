@@ -309,17 +309,16 @@ Status decode_archive_attempt(std::span<const std::uint8_t> archive, const FileH
   const std::size_t esz = dtype_size(h.dtype);
   const std::size_t brick_vox = static_cast<std::size_t>(kBrickDim) * kBrickDim * kBrickDim;
 
-  // Sparse-scratch capacity per chunk.
+  // Sparse-scratch capacity per chunk, chosen by the caller.
   //
   // The worst case is 4096 -- every coefficient nonzero -- but real chunks hold
   // a few dozen to a few hundred at any useful rate, and sizing for the worst
   // case meant allocating over half a gigabyte of device memory that was never
   // touched. cudaMalloc of that size cost more than the kernels it fed.
   //
-  // So the buffer is sized for the realistic case and K1 reports an overflow
-  // instead of writing past the end; `decode_archive` retries at full capacity.
-  // A first pass that overflows costs one wasted launch, which is far cheaper
-  // than the allocation it avoids on every normal decode.
+  // Normally the archive's index says exactly how much is needed. When it does
+  // not, the caller passes a guess and K1 reports an overflow instead of writing
+  // past the end, so `decode_archive` can retry at full capacity.
   const std::uint32_t max_nz = attempt_max_nz;
   const std::size_t per_brick =
       static_cast<std::size_t>(kChunksPerBrick) * max_nz * (2 + 2) +
@@ -923,16 +922,53 @@ Status decode_archive_attempt(std::span<const std::uint8_t> archive, const FileH
 
 }  // namespace
 
-// Typical chunk occupancy at the rates this codec targets, with headroom. A
-// chunk denser than this is legal, just rare enough not to size every buffer for.
+// Fallback chunk occupancy, used only for archives whose index does not record
+// the real one. Typical at the rates this codec targets, with headroom; a chunk
+// denser than this is legal, just rare enough not to size every buffer for.
 constexpr std::uint32_t kTypicalMaxNonzero = 768;
+
+// The sparse-scratch capacity an archive's index asks for: the largest per-chunk
+// nonzero count over every brick, from BrickEntry::max_nonzero.
+//
+// Returns 0 for "not recorded", which is what every archive written before the
+// field existed says, and also what any archive says whose index is damaged or
+// dishonest -- a single entry outside [1, kChunkVox] disqualifies the whole
+// index rather than being clamped, because a value that cannot have come from
+// the encoder is no evidence about the ones next to it. The caller then falls
+// back to guessing and retrying on overflow, which is always correct.
+//
+// Raw-mode bricks record 0 legitimately and are skipped: without that, one air
+// brick would disable the hint for the entire volume.
+[[nodiscard]] std::uint32_t index_max_nonzero(std::span<const std::uint8_t> archive,
+                                              const FileHeader& h) {
+  std::uint32_t m = 0;
+  for (std::uint64_t i = 0; i < h.brick_count; ++i) {
+    const std::size_t e =
+        static_cast<std::size_t>(h.index_offset + i * detail::BrickEntry::kSize);
+    if (e + detail::BrickEntry::kSize > archive.size()) return 0;
+    const std::uint64_t off = detail::get_u64(archive, e);
+    const std::uint32_t size = detail::get_u32(archive, e + 8);
+    if (off >= archive.size() || size == 0 || size > archive.size() - off) return 0;
+    if (archive[static_cast<std::size_t>(off)] != 0) continue;  // 0 == coded mode
+    const std::uint32_t v = detail::get_u32(archive, e + 12);
+    if (v == 0 || v > static_cast<std::uint32_t>(kChunkVox)) return 0;
+    m = std::max(m, v);
+  }
+  return m;
+}
 
 Status decode_archive(std::span<const std::uint8_t> archive, const FileHeader& h,
                       const QuantMatrix& qm, const ModelSet& ms, std::span<std::uint8_t> out,
                       float deblock_rms, float deblock_strength) {
   bool overflowed = false;
-  const Status s = decode_archive_attempt(archive, h, qm, ms, kTypicalMaxNonzero, out, overflowed,
-                                          deblock_rms, deblock_strength);
+  // On real scroll data the guess overflowed every time, and a first pass that
+  // overflows throws away the allocations, the archive upload and the model
+  // upload as well as its kernels -- 28 ms of a measured 161 ms decode. With the
+  // index recording the answer there is nothing to guess.
+  const std::uint32_t recorded = index_max_nonzero(archive, h);
+  const Status s = decode_archive_attempt(archive, h, qm, ms,
+                                          recorded != 0 ? recorded : kTypicalMaxNonzero, out,
+                                          overflowed, deblock_rms, deblock_strength);
   if (!overflowed) return s;
   return decode_archive_attempt(archive, h, qm, ms, kChunkVox, out, overflowed, deblock_rms,
                                 deblock_strength);
@@ -998,7 +1034,7 @@ Status encode_bricks_attempt(const void* data, Dims dims, DType dtype, float sca
                              const ModelSet& ms, std::uint32_t P, int kEncSymCapacity,
                              bool rdo, bool per_brick_tables,
                              std::vector<std::vector<std::uint8_t>>& payloads,
-                             bool& overflowed) {
+                             std::vector<std::uint32_t>& brick_max_nz, bool& overflowed) {
   overflowed = false;
   if (!available()) return Status::backend_unavailable;
 
@@ -1044,6 +1080,7 @@ Status encode_bricks_attempt(const void* data, Dims dims, DType dtype, float sca
   const std::uint64_t brick_count =
       static_cast<std::uint64_t>(grid.x) * grid.y * grid.z;
   payloads.assign(static_cast<std::size_t>(brick_count), {});
+  brick_max_nz.assign(static_cast<std::size_t>(brick_count), 0);
 
   std::uint8_t* d_volume = nullptr;
   float* d_rquant = nullptr;
@@ -1096,6 +1133,7 @@ Status encode_bricks_attempt(const void* data, Dims dims, DType dtype, float sca
   std::uint32_t* d_error = nullptr;
   EncSym* d_syms = nullptr;
   std::uint32_t* d_counts = nullptr;
+  std::uint32_t* d_nz = nullptr;
   std::uint32_t* d_hist = nullptr;
   DeviceEncSymbol* d_btab = nullptr;
   std::uint8_t* d_bmap = nullptr;
@@ -1111,6 +1149,7 @@ Status encode_bricks_attempt(const void* data, Dims dims, DType dtype, float sca
     cudaFree(d_error);
     cudaFree(d_syms);
     cudaFree(d_counts);
+    cudaFree(d_nz);
     cudaFree(d_hist);
     cudaFree(d_btab);
     cudaFree(d_bmap);
@@ -1131,6 +1170,7 @@ Status encode_bricks_attempt(const void* data, Dims dims, DType dtype, float sca
       cudaMalloc(&d_syms, batch * kChunksPerBrick * static_cast<std::size_t>(kEncSymCapacity) *
                               sizeof(EncSym)) != cudaSuccess ||
       cudaMalloc(&d_counts, batch * kChunksPerBrick * 4) != cudaSuccess ||
+      cudaMalloc(&d_nz, batch * 4) != cudaSuccess ||
       (per_brick_tables &&
        (cudaMalloc(&d_hist, batch * detail::ModelIndex::total * 256 * 4) != cudaSuccess ||
         cudaMalloc(&d_btab, batch * detail::kMaxBrickTables * 256 * sizeof(DeviceEncSymbol)) !=
@@ -1183,7 +1223,8 @@ Status encode_bricks_attempt(const void* data, Dims dims, DType dtype, float sca
     }
     if (cudaMemcpy(d_origins, origins.data(), n * 3 * 4, cudaMemcpyHostToDevice) !=
             cudaSuccess ||
-        cudaMemset(d_error, 0, 4) != cudaSuccess) {
+        cudaMemset(d_error, 0, 4) != cudaSuccess ||
+        cudaMemset(d_nz, 0, static_cast<std::size_t>(n) * 4) != cudaSuccess) {
       cleanup();
       return Status::io_error;
     }
@@ -1219,7 +1260,7 @@ Status encode_bricks_attempt(const void* data, Dims dims, DType dtype, float sca
       const std::uint32_t chunks = n * kChunksPerBrick;
       ke2a_build_symbols<<<(chunks + kKE2AThreads - 1) / kKE2AThreads, kKE2AThreads>>>(
           d_levels, chunks, d_syms, kEncSymCapacity, d_counts,
-          per_brick_tables ? d_hist : nullptr, d_error);
+          per_brick_tables ? d_hist : nullptr, d_nz, d_error);
     }
     stamp(ec);
     // Per-brick tables: histogram on the device, cluster on the host, upload.
@@ -1342,7 +1383,9 @@ Status encode_bricks_attempt(const void* data, Dims dims, DType dtype, float sca
 
     const std::uint32_t nstreams = n * P;
     if (cudaMemcpy(sizes.data(), d_sizes, static_cast<std::size_t>(nstreams) * 4,
-                   cudaMemcpyDeviceToHost) != cudaSuccess) {
+                   cudaMemcpyDeviceToHost) != cudaSuccess ||
+        cudaMemcpy(brick_max_nz.data() + static_cast<std::size_t>(b0), d_nz,
+                   static_cast<std::size_t>(n) * 4, cudaMemcpyDeviceToHost) != cudaSuccess) {
       cleanup();
       return Status::io_error;
     }
@@ -1427,11 +1470,13 @@ Status encode_bricks_attempt(const void* data, Dims dims, DType dtype, float sca
 Status encode_bricks(const void* data, Dims dims, DType dtype, float scale, float offset,
                      const QuantMatrix& qm, float deadzone, const ModelSet& ms,
                      std::uint32_t P, bool rdo, bool per_brick_tables,
-                     std::vector<std::vector<std::uint8_t>>& payloads) {
+                     std::vector<std::vector<std::uint8_t>>& payloads,
+                     std::vector<std::uint32_t>& brick_max_nz) {
   for (int cap : kEncSymCapacities) {
     bool overflowed = false;
     const Status s = encode_bricks_attempt(data, dims, dtype, scale, offset, qm, deadzone, ms,
-                                           P, cap, rdo, per_brick_tables, payloads, overflowed);
+                                           P, cap, rdo, per_brick_tables, payloads,
+                                           brick_max_nz, overflowed);
     if (!overflowed) return s;
   }
   return Status::backend_unavailable;
@@ -1523,11 +1568,15 @@ Status device_volume_open_impl(std::span<const std::uint8_t> archive,
   v->max_level = detail::max_plausible_level(qm);
   v->lo = dtype_min(v->h.dtype);
   v->hi = dtype_max(v->h.dtype);
-  // Sparse scratch is sized for typical chunk occupancy, not the worst case, and
-  // grown on demand. Sizing for 4096 nonzeros per chunk costs 8.4 MB of device
-  // memory per brick of batch -- which on a volume whose whole point is to stay
-  // compressed in VRAM is absurd: the scratch would dwarf the archive.
-  v->max_nz = kTypicalMaxNonzero;
+  // Sparse scratch is sized from the index's recorded per-chunk occupancy, and
+  // where the index does not carry one, for typical occupancy and grown on
+  // demand. Sizing for 4096 nonzeros per chunk costs 8.4 MB of device memory per
+  // brick of batch -- which on a volume whose whole point is to stay compressed
+  // in VRAM is absurd: the scratch would dwarf the archive.
+  {
+    const std::uint32_t recorded = index_max_nonzero(archive, v->h);
+    v->max_nz = recorded != 0 ? recorded : kTypicalMaxNonzero;
+  }
 
   if (cudaMalloc(&v->d_archive, archive.size()) != cudaSuccess ||
       cudaMemcpy(v->d_archive, archive.data(), archive.size(), cudaMemcpyHostToDevice) !=
