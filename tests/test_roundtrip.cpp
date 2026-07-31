@@ -150,20 +150,51 @@ TEST(non_multiple_dimensions_round_trip) {
 }
 
 TEST(every_dtype_round_trips) {
-  const Volume base = scroll_like_volume({48, 40, 36});
+  // deterministic_volume, not scroll_like_volume, and for the reason that
+  // generator was written: it is built from integer arithmetic only, so it
+  // produces the same volume on every ISA.
+  //
+  // scroll_like_volume clips to [0, 255] after summing 24 blobs whose radii
+  // scale with the dimensions but whose count and amplitude do not. At 48x40x36
+  // that sum is several times the ceiling nearly everywhere, so the clip
+  // flattened almost the whole volume to exactly 255 and whether *any* voxel
+  // escaped came down to a 1-ULP difference in std::exp. Same machine, same
+  // source: usable data at the SSE2 baseline, a completely constant volume at
+  // -mavx2. This test then rescaled that constant volume for the f32 case, got a
+  // zero peak, and reported PSNR -inf -- which reads as a catastrophic codec
+  // failure and was entirely an artifact of the input. The codec had reproduced
+  // the constant to within one float epsilon.
+  const Volume base = deterministic_volume({48, 40, 36}, 7);
   for (DType t : {DType::u8, DType::s8, DType::u16, DType::s16, DType::u32, DType::s32,
                   DType::f32}) {
     Volume v = base;
     // Rescale into each dtype's natural range so the test is measuring the
-    // codec rather than saturation.
-    const float lo = dtype_min(t) == -3.402823466e38f ? -1.0f : dtype_min(t);
-    const float hi = dtype_max(t) == 3.402823466e38f ? 1.0f : dtype_max(t);
+    // codec rather than saturation. f32 has no natural range, so it gets
+    // [-1, 1] picked for it.
+    //
+    // This used to identify f32 by comparing dtype_min(t) against a literal
+    // -3.402823466e38f. That is a float equality against a decimal that does not
+    // round-trip to exactly FLT_MAX, under -ffast-math, and it held only by
+    // luck: at the SSE2 baseline the comparison folded true, and at -mavx2 it
+    // folded false. When it folds false, lo becomes -3.4e38 and hi 3.4e38, hi-lo
+    // overflows to infinity, span clamps to 65535, and every voxel becomes
+    // -3.4e38 + (something tiny) == -3.4e38. The volume is then constant, its
+    // peak is zero, and the reported PSNR is -inf -- a total failure that looks
+    // like a codec bug and is entirely an artifact of the test.
+    const bool is_float = (t == DType::f32);
+    const float lo = is_float ? -1.0f : dtype_min(t);
+    const float hi = is_float ? 1.0f : dtype_max(t);
     const float span = std::min(hi - lo, 65535.0f);
     for (float& f : v.data) f = lo + (f / 255.0f) * span;
 
     EncodeOptions opts;
     opts.quality = 4.0f;
     const Stats s = round_trip(v, t, opts);
+    // A constant input has zero peak and so scores -inf however good the
+    // reconstruction is. That is a broken test rather than a broken codec, and
+    // it happened: see the normalization note in scroll_like_volume.
+    REQUIRE(*std::max_element(v.data.begin(), v.data.end()) >
+            *std::min_element(v.data.begin(), v.data.end()));
     if (s.psnr <= 25.0)
       std::printf("       dtype %s psnr=%.2f\n", std::string(dtype_name(t)).c_str(), s.psnr);
     CHECK(s.psnr > 25.0);

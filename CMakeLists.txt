@@ -63,7 +63,18 @@ add_library(gpudct_flags INTERFACE)
 # CUDA sources must not see them at all.
 set(_gpudct_cxx_flags "")
 
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86|AMD64|amd64)" OR CMAKE_SIZEOF_VOID_P EQUAL 8)
+# x86 only, and the guard has to actually say that.
+#
+# It used to end with `OR CMAKE_SIZEOF_VOID_P EQUAL 8`, which is true on every
+# 64-bit platform there is -- so configuring with -DGPUDCT_X86_BASELINE=avx2 on
+# aarch64 appended -mavx2 and the build died at the first source file. Nothing
+# caught it because nothing has ever built this on ARM.
+#
+# There is no matching branch for aarch64 and there should not be: NEON is
+# architecturally mandatory on AArch64, so the lane-parallel transform vectorizes
+# with no flag at all. The 16-lane width in src/cpu/transform_simd.hpp was chosen
+# partly for that -- 16 floats is one AVX-512 register, two AVX2, or four NEON.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86|x86_64|AMD64|amd64|i[3-6]86)")
   if(GPUDCT_X86_BASELINE STREQUAL "avx2")
     if(MSVC)
       list(APPEND _gpudct_cxx_flags /arch:AVX2)
