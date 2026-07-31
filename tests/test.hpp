@@ -10,6 +10,20 @@
 #include <string>
 #include <vector>
 
+// MSVC C4127, "conditional expression is constant", on every assertion macro
+// below. Two sources, both unavoidable and both harmless: the `while (0)` that
+// makes a macro a single statement, and any assertion comparing constexpr
+// values -- CHECK_EQ(band_of_subblock(0, 0, 0), 0) is a constant expression and
+// so warns, which is exactly the kind of assertion a test should be making.
+// `if constexpr`, which the diagnostic suggests, would change the semantics of
+// every macro to serve a warning that has nothing to tell us here.
+//
+// Real MSVC only; clang-cl does not issue it, which is why -Werror passed
+// locally for a long time and failed the moment CI ran a genuine cl.exe.
+#ifdef _MSC_VER
+#pragma warning(disable : 4127)
+#endif
+
 namespace gpudct_test {
 
 struct Case {
