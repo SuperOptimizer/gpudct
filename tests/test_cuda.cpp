@@ -235,7 +235,8 @@ TEST(cuda_rdo_matches_cpu_rdo) {
     REQUIRE(encode(raw.data(), v.dims, DType::u8, opts, cpu, Backend::cpu_scalar) == Status::ok);
     REQUIRE(encode(raw.data(), v.dims, DType::u8, opts, gpu, Backend::cuda) == Status::ok);
 
-    const double dsize = std::fabs(static_cast<double>(cpu.size()) - gpu.size()) /
+    const double dsize = std::fabs(static_cast<double>(cpu.size()) -
+                                   static_cast<double>(gpu.size())) /
                          static_cast<double>(cpu.size());
     std::printf("       q=%.2f  cpu %zu B  gpu %zu B  (%.4f%% apart)\n",
                 static_cast<double>(q), cpu.size(), gpu.size(), dsize * 100.0);
@@ -293,7 +294,8 @@ TEST(cuda_encode_matches_cpu) {
     REQUIRE(encode(raw.data(), v.dims, DType::u8, opts, cpu_r, Backend::cpu_scalar) ==
             Status::ok);
     REQUIRE(encode(raw.data(), v.dims, DType::u8, opts, gpu_r, Backend::cuda) == Status::ok);
-    const double dsize = std::fabs(static_cast<double>(cpu_r.size()) - gpu_r.size()) /
+    const double dsize = std::fabs(static_cast<double>(cpu_r.size()) -
+                                   static_cast<double>(gpu_r.size())) /
                          static_cast<double>(cpu_r.size());
     std::printf("       q=%.2f rdo: cpu %zu B, gpu %zu B (%.4f%% apart)\n",
                 static_cast<double>(q), cpu_r.size(), gpu_r.size(), dsize * 100.0);

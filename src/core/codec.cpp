@@ -41,15 +41,42 @@ using namespace detail;
 // and s32 lose their low bits here -- deliberately, since a codec quantizing to
 // a few hundred levels has no use for bit 25.
 // --------------------------------------------------------------------------
+// Read through memcpy rather than a pointer cast, because `base` is not always
+// aligned for the type being read and a cast would be undefined behaviour.
+//
+// A raw-mode brick payload is a one-byte mode tag followed by verbatim voxels,
+// so the decoder reads it at `payload.data() + 1`. For any dtype wider than a
+// byte that base is misaligned by construction -- on a u16 volume it is always
+// odd. x86 does not care and MSVC never complained, so this stood until a
+// UBSan-enabled CI job on Linux reported it against exactly that path.
+//
+// It is not merely pedantic. A strict-alignment target faults on it, and both
+// clang and gcc are entitled to assume the pointer is aligned and vectorize
+// accordingly, which is the kind of miscompile that appears at one optimization
+// level and not another. memcpy of a trivially copyable type is the idiom that
+// makes it defined, and every compiler here folds it back to a single unaligned
+// load, so it costs nothing.
+template <typename T>
+[[nodiscard]] inline T read_unaligned(const void* base, std::size_t i) {
+  T v;
+  std::memcpy(&v, static_cast<const std::uint8_t*>(base) + i * sizeof(T), sizeof(T));
+  return v;
+}
+
+template <typename T>
+inline void write_unaligned(void* base, std::size_t i, T v) {
+  std::memcpy(static_cast<std::uint8_t*>(base) + i * sizeof(T), &v, sizeof(T));
+}
+
 [[nodiscard]] inline float load_voxel(const void* base, DType t, std::size_t i) {
   switch (t) {
-    case DType::u8:  return static_cast<float>(static_cast<const std::uint8_t*>(base)[i]);
-    case DType::s8:  return static_cast<float>(static_cast<const std::int8_t*>(base)[i]);
-    case DType::u16: return static_cast<float>(static_cast<const std::uint16_t*>(base)[i]);
-    case DType::s16: return static_cast<float>(static_cast<const std::int16_t*>(base)[i]);
-    case DType::u32: return static_cast<float>(static_cast<const std::uint32_t*>(base)[i]);
-    case DType::s32: return static_cast<float>(static_cast<const std::int32_t*>(base)[i]);
-    case DType::f32: return static_cast<const float*>(base)[i];
+    case DType::u8:  return static_cast<float>(read_unaligned<std::uint8_t>(base, i));
+    case DType::s8:  return static_cast<float>(read_unaligned<std::int8_t>(base, i));
+    case DType::u16: return static_cast<float>(read_unaligned<std::uint16_t>(base, i));
+    case DType::s16: return static_cast<float>(read_unaligned<std::int16_t>(base, i));
+    case DType::u32: return static_cast<float>(read_unaligned<std::uint32_t>(base, i));
+    case DType::s32: return static_cast<float>(read_unaligned<std::int32_t>(base, i));
+    case DType::f32: return read_unaligned<float>(base, i);
   }
   return 0.0f;
 }
@@ -58,13 +85,15 @@ inline void store_voxel(void* base, DType t, std::size_t i, float v) {
   const float lo = dtype_min(t), hi = dtype_max(t);
   const float c = std::clamp(v, lo, hi);
   switch (t) {
-    case DType::u8:  static_cast<std::uint8_t*>(base)[i]  = static_cast<std::uint8_t>(std::lrintf(c)); break;
-    case DType::s8:  static_cast<std::int8_t*>(base)[i]   = static_cast<std::int8_t>(std::lrintf(c)); break;
-    case DType::u16: static_cast<std::uint16_t*>(base)[i] = static_cast<std::uint16_t>(std::lrintf(c)); break;
-    case DType::s16: static_cast<std::int16_t*>(base)[i]  = static_cast<std::int16_t>(std::lrintf(c)); break;
-    case DType::u32: static_cast<std::uint32_t*>(base)[i] = static_cast<std::uint32_t>(std::llrintf(c)); break;
-    case DType::s32: static_cast<std::int32_t*>(base)[i]  = static_cast<std::int32_t>(std::llrintf(c)); break;
-    case DType::f32: static_cast<float*>(base)[i] = v; break;
+    // Symmetric with load_voxel above, and for the same reason: the destination
+    // is not always aligned for the type being written.
+    case DType::u8:  write_unaligned<std::uint8_t>(base, i, static_cast<std::uint8_t>(std::lrintf(c))); break;
+    case DType::s8:  write_unaligned<std::int8_t>(base, i, static_cast<std::int8_t>(std::lrintf(c))); break;
+    case DType::u16: write_unaligned<std::uint16_t>(base, i, static_cast<std::uint16_t>(std::lrintf(c))); break;
+    case DType::s16: write_unaligned<std::int16_t>(base, i, static_cast<std::int16_t>(std::lrintf(c))); break;
+    case DType::u32: write_unaligned<std::uint32_t>(base, i, static_cast<std::uint32_t>(std::llrintf(c))); break;
+    case DType::s32: write_unaligned<std::int32_t>(base, i, static_cast<std::int32_t>(std::llrintf(c))); break;
+    case DType::f32: write_unaligned<float>(base, i, v); break;
   }
 }
 

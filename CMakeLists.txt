@@ -4,8 +4,23 @@ project(gpudct LANGUAGES CXX VERSION 0.1.0)
 # ---------------------------------------------------------------------------
 # Standard / options
 # ---------------------------------------------------------------------------
-set(CMAKE_CXX_STANDARD 26)
-set(CMAKE_CXX_STANDARD_REQUIRED OFF)   # fall back to 23 on older toolchains
+# C++23, required.
+#
+# This said 26 with STANDARD_REQUIRED OFF and a comment claiming it would "fall
+# back to 23 on older toolchains". It does not. When the compiler cannot do the
+# requested standard, CMake with REQUIRED OFF omits the -std flag altogether and
+# you get the compiler's default -- gnu++17 on gcc-13, which is two standards
+# below what this code needs. It built anyway on clang and MSVC because both
+# default to something recent enough, so the breakage was invisible until a gcc
+# job ran and failed on a defaulted operator== and on std::span not existing.
+#
+# 23 is what the source actually targets: src/core/dct16.hpp explicitly avoids
+# constexpr <cmath>, which is C++26-only, in order to keep building under C++23.
+# Nothing here needs 26, so ask for what is needed and require it, and a
+# toolchain that cannot provide it fails at configure time with a clear message
+# instead of at compile time with a confusing one.
+set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 

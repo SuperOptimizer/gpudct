@@ -223,7 +223,7 @@ jobs:
           cmake -B build -S . -G Ninja
           -DCMAKE_BUILD_TYPE=Release
           -DGPUDCT_ENABLE_CUDA=ON
-          -DCMAKE_CUDA_ARCHITECTURES=${{ steps.cudaver.outputs.archs }}
+          "-DCMAKE_CUDA_ARCHITECTURES=${{ steps.cudaver.outputs.archs }}"
 
       - name: Build (compile only -- no GPU to test on)
         run: cmake --build build --parallel
