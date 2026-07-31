@@ -141,12 +141,34 @@ if(GPUDCT_ENABLE_CUDA)
   include(CheckLanguage)
   check_language(CUDA)
   if(CMAKE_CUDA_COMPILER)
+    # Before enable_language(CUDA), and that ordering is the whole point.
+    #
+    # enable_language(CUDA) initializes CMAKE_CUDA_ARCHITECTURES itself if it is
+    # not already set -- to whatever the toolkit's default is, which for CUDA
+    # 13.3 here is 75. Setting it afterwards behind `if(NOT DEFINED)` therefore
+    # never fired, and every CUDA build that did not pass the option explicitly
+    # was compiled for Turing: native code for none of the RTX 30xx, 40xx or
+    # 50xx parts this is meant to run on, reaching them only through a PTX JIT.
+    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+      # One entry per shipping generation, plus PTX for anything newer.
+      #
+      #   86  Ampere consumer -- RTX 30xx (GA102/104/106). NOT 80: that is
+      #       GA100/A100, and its SASS is not compatible with GA10x. The list
+      #       used to say 80 89 120, which left every RTX 30xx part to reach the
+      #       device through a PTX JIT at first launch rather than running the
+      #       native code that was supposed to be there for it.
+      #   89  Ada        -- RTX 40xx
+      #   120 Blackwell  -- RTX 50xx (needs CUDA 13+)
+      #
+      # The trailing virtual entry embeds PTX so a future architecture still
+      # runs, JIT-compiled, instead of failing to load. Each real entry costs
+      # fatbin size and compile time, which is the whole reason not to simply
+      # list every capability CUDA knows about.
+      set(CMAKE_CUDA_ARCHITECTURES 86-real 89-real 120-real 120-virtual)
+    endif()
     enable_language(CUDA)
     set(CMAKE_CUDA_STANDARD 20)          # nvcc tops out at C++20
     set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-      set(CMAKE_CUDA_ARCHITECTURES 80 89 120)
-    endif()
     message(STATUS "  CUDA arch: ${CMAKE_CUDA_ARCHITECTURES}")
   else()
     message(WARNING "GPUDCT_ENABLE_CUDA=ON but no CUDA compiler found; disabling")
