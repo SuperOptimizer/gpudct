@@ -1,12 +1,11 @@
 name: ci
 
-# The CUDA backend is deliberately not built here: GitHub's hosted runners have
-# no NVIDIA GPU, and a build-only CUDA job would compile kernels nothing ever
-# runs. Cross-backend equivalence (docs/QUALITY.md 4.2) is the load-bearing test
-# for that path and it needs a device, so it stays a local gate for now.
-#
-# What this does catch is the failure that motivated it: a backend that stops
-# compiling without anyone noticing.
+# The CUDA *runtime* is deliberately not exercised here: GitHub's hosted runners
+# have no NVIDIA GPU, and cross-backend equivalence (docs/QUALITY.md 4.2) needs a
+# device, so that stays a local gate for now. The cuda-compile job below does
+# still compile the backend for every target architecture -- see its comment --
+# which catches the failure that motivated adding CI at all: a backend that
+# stops compiling without anyone noticing.
 
 on:
   push:
@@ -26,58 +25,102 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: linux-clang-release
+          - name: linux-clang-release-sse2
             os: ubuntu-24.04
             preset_cc: clang
             build_type: Release
-          - name: linux-clang-debug
+            x86_baseline: sse2
+          - name: linux-clang-release-avx2
+            os: ubuntu-24.04
+            preset_cc: clang
+            build_type: Release
+            x86_baseline: avx2
+          - name: linux-clang-debug-sse2
             os: ubuntu-24.04
             preset_cc: clang
             build_type: Debug
-          - name: linux-gcc-release
+            x86_baseline: sse2
+          - name: linux-gcc-release-sse2
             os: ubuntu-24.04
             preset_cc: gcc
             build_type: Release
-          - name: windows-msvc-release
+            x86_baseline: sse2
+          - name: linux-gcc-release-avx2
+            os: ubuntu-24.04
+            preset_cc: gcc
+            build_type: Release
+            x86_baseline: avx2
+          - name: windows-msvc-release-sse2
             os: windows-2022
             preset_cc: msvc
             build_type: Release
+            x86_baseline: sse2
+          - name: windows-msvc-release-avx2
+            os: windows-2022
+            preset_cc: msvc
+            build_type: Release
+            x86_baseline: avx2
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install clang
+      - name: Install clang and ninja
         if: matrix.preset_cc == 'clang'
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang-18
+          sudo apt-get install -y clang-18 ninja-build
           echo "CC=clang-18"  >> "$GITHUB_ENV"
           echo "CXX=clang++-18" >> "$GITHUB_ENV"
 
-      - name: Select gcc
+      - name: Select gcc, install ninja
         if: matrix.preset_cc == 'gcc'
         run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
           echo "CC=gcc-13"  >> "$GITHUB_ENV"
           echo "CXX=g++-13" >> "$GITHUB_ENV"
 
       - uses: ilammy/msvc-dev-cmd@v1
         if: matrix.preset_cc == 'msvc'
 
+      # AVX-512 is deliberately not covered here: GitHub's hosted runner fleet
+      # (Azure Dv5/Dv4-family images, as of this writing) does not guarantee an
+      # AVX-512-capable host, so a "native" or explicit avx512 job would either
+      # fail to compile-test what it claims or silently downgrade -- neither is
+      # worth a job that lies about its own coverage. sse2 and avx2 are the two
+      # baselines GPUDCT_X86_BASELINE actually ships, so those are what run here.
+      #
       # Warnings are errors in CI only. Locally an in-progress edit should not
       # be blocked by an unused variable; on a shared branch it should.
       - name: Configure
         run: >
-          cmake -B build -S .
+          cmake -B build -S . -G Ninja
           -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
           -DGPUDCT_WERROR=ON
           -DGPUDCT_ENABLE_CUDA=OFF
+          -DGPUDCT_X86_BASELINE=${{ matrix.x86_baseline }}
 
       - name: Build
-        run: cmake --build build --config ${{ matrix.build_type }} --parallel
+        run: cmake --build build --parallel
+
+      # tests/data/conformance/*.gdct is gitignored (*.gdct, tests/data/corpus/)
+      # by design -- test_conformance.cpp says regenerating it defeats the point
+      # of the test, so it is never committed either. That also means a fresh
+      # checkout has neither the files nor the directory, and test_conformance
+      # hard-fails (not skips) on a missing file, so both have to be made here.
+      # make_conformance is the corpus writer: built by default but deliberately
+      # not registered with ctest, so it has to be run explicitly before testing.
+      - name: Generate conformance corpus
+        shell: bash
+        run: |
+          mkdir -p tests/data/conformance
+          bin=build/tests/make_conformance
+          [ -f "$bin.exe" ] && bin="$bin.exe"
+          "$bin"
 
       - name: Test
         working-directory: build
-        run: ctest --build-config ${{ matrix.build_type }} --output-on-failure
+        run: ctest --output-on-failure
 
   sanitizers:
     name: sanitizers (${{ matrix.san }})
@@ -89,10 +132,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install clang
+      - name: Install clang and ninja
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang-18
+          sudo apt-get install -y clang-18 ninja-build
           echo "CC=clang-18"  >> "$GITHUB_ENV"
           echo "CXX=clang++-18" >> "$GITHUB_ENV"
 
@@ -108,7 +151,7 @@ jobs:
       # that an unoptimized build turns the round-trip tests into a timeout.
       - name: Configure
         run: >
-          cmake -B build -S .
+          cmake -B build -S . -G Ninja
           -DCMAKE_BUILD_TYPE=RelWithDebInfo
           -DGPUDCT_ENABLE_CUDA=OFF
           -DCMAKE_CXX_FLAGS="$SAN_FLAGS"
@@ -117,9 +160,73 @@ jobs:
       - name: Build
         run: cmake --build build --parallel
 
+      # See the comment on the same step in the build job: the corpus is
+      # gitignored and must be generated before ctest can find it.
+      - name: Generate conformance corpus
+        run: |
+          mkdir -p tests/data/conformance
+          build/tests/make_conformance
+
       - name: Test
         working-directory: build
         run: ctest --output-on-failure --timeout 1200
+
+  # Hosted runners have no NVIDIA GPU, so this compiles the CUDA backend for
+  # every architecture the project targets and stops there -- it cannot run the
+  # codec or its tests. That still catches the large class of errors only nvcc
+  # finds (kernel launch syntax, __device__/__host__ mismatches, template
+  # instantiation across the host/device boundary) without anyone owning a
+  # 30xx/40xx/50xx card needing to notice by hand.
+  cuda-compile:
+    name: cuda-compile-only (no GPU on this runner, does not run tests)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ninja
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
+
+      # Installs whatever CUDA release NVIDIA's apt repo currently publishes for
+      # noble. sm_120 (RTX 50xx / Blackwell) needs CUDA 13+ to assemble and older
+      # toolkits fail on that entry alone rather than on the rest of the list, so
+      # the version is checked below and the list narrowed deliberately instead
+      # of failing opaquely deep in the build.
+      #
+      # The list is passed explicitly rather than relying on the CMakeLists
+      # default, so that this job fails loudly if the two drift apart. Keep it in
+      # sync with the default in CMakeLists.txt.
+      - name: Install CUDA toolkit
+        run: |
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update
+          sudo apt-get install -y cuda-toolkit
+          echo "/usr/local/cuda/bin" >> "$GITHUB_PATH"
+          echo "CUDACXX=/usr/local/cuda/bin/nvcc" >> "$GITHUB_ENV"
+
+      - name: Report CUDA version, pick architecture list
+        id: cudaver
+        run: |
+          nvcc --version
+          major=$(nvcc --version | grep -oP 'release \K[0-9]+')
+          if [ "$major" -ge 13 ]; then
+            echo "archs=86-real;89-real;120-real;120-virtual" >> "$GITHUB_OUTPUT"
+          else
+            echo "CUDA toolkit is $major.x (<13): sm_120 (RTX 50xx) cannot be assembled, so this job covers Ampere and Ada only." >&2
+            echo "archs=86-real;89-real;89-virtual" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Configure
+        run: >
+          cmake -B build -S . -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DGPUDCT_ENABLE_CUDA=ON
+          -DCMAKE_CUDA_ARCHITECTURES=${{ steps.cudaver.outputs.archs }}
+
+      - name: Build (compile only -- no GPU to test on)
+        run: cmake --build build --parallel
 
   format:
     name: clang-format
