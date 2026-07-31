@@ -580,17 +580,22 @@ Status decode_archive_attempt(std::span<const std::uint8_t> archive, const FileH
     // into device memory is still in flight when the call returns, and its
     // ordering against a kernel is carried by the stream it was issued on.
     // Issued on the null stream, nothing ordered that DMA before K1 read the
-    // tables, so K1 could decode a brick against another batch's frequency
-    // tables and walk off the end of the stream. It reproduced as
-    // `corrupt_bitstream` on the *second* batch of any real volume -- synthetic
-    // test data never hit it because uniform statistics make every brick decline
-    // per-brick tables, leaving nothing for the race to corrupt.
+    // tables, so K1 could decode a brick against a partially written table and
+    // walk off the end of its rANS stream.
+    //
+    // This was found while chasing a `corrupt_bitstream` that hit every real
+    // scroll volume at every quality and no synthetic one, always on a batch
+    // after the first, always on a brick near the end of the batch's arrays --
+    // which is the signature of a partly-landed upload. Being a race, it stopped
+    // reproducing before the fix could be A/B'd against it, so treat the
+    // connection as strongly indicated rather than proven. The ordering
+    // violation is a defect on its own terms either way.
     //
     // cudaMemsetAsync for the same reason: cudaMemset is asynchronous with
     // respect to the host and lands on the null stream.
     if (direct &&
-        cudaMemcpy(d_origins, origins.data(), n * 3 * sizeof(std::uint32_t),
-                        cudaMemcpyHostToDevice) != cudaSuccess) {
+        cudaMemcpyAsync(d_origins, origins.data(), n * 3 * sizeof(std::uint32_t),
+                        cudaMemcpyHostToDevice, ks) != cudaSuccess) {
       cleanup();
       return Status::io_error;
     }
@@ -598,22 +603,23 @@ Status decode_archive_attempt(std::span<const std::uint8_t> archive, const FileH
     // Upload the compact frequency tables and expand them on the device.
     const std::uint32_t ntab = static_cast<std::uint32_t>(tab_freq.size() / 256);
     if (ntab > 0) {
-      if (cudaMemcpy(d_tab_freq, tab_freq.data(), tab_freq.size() * 2,
-                          cudaMemcpyHostToDevice) != cudaSuccess) {
+      if (cudaMemcpyAsync(d_tab_freq, tab_freq.data(), tab_freq.size() * 2,
+                          cudaMemcpyHostToDevice, ks) != cudaSuccess) {
         cleanup();
         return Status::io_error;
       }
       k0_build_brick_tables<<<ntab, 256, 0, ks>>>(d_tab_freq, d_tab_fc, d_tab_slot, ntab);
     }
-    if (cudaMemcpy(d_tab_map, tab_map.data(), tab_map.size(), cudaMemcpyHostToDevice) !=
+    if (cudaMemcpyAsync(d_tab_map, tab_map.data(), tab_map.size(), cudaMemcpyHostToDevice, ks) !=
             cudaSuccess ||
-        cudaMemcpy(d_tab_base, tab_base.data(), n * 4, cudaMemcpyHostToDevice) !=
+        cudaMemcpyAsync(d_tab_base, tab_base.data(), n * 4, cudaMemcpyHostToDevice, ks) !=
             cudaSuccess ||
-        cudaMemcpy(d_tab_count, tab_count.data(), n * 4, cudaMemcpyHostToDevice) !=
+        cudaMemcpyAsync(d_tab_count, tab_count.data(), n * 4, cudaMemcpyHostToDevice, ks) !=
             cudaSuccess ||
-        cudaMemcpy(d_descs, descs.data(), n * sizeof(BrickDesc), cudaMemcpyHostToDevice) != cudaSuccess ||
-        cudaMemset(d_error, 0, 8) != cudaSuccess ||
-        cudaMemset(d_counts, 0, static_cast<std::size_t>(n) * kChunksPerBrick * 4) !=
+        cudaMemcpyAsync(d_descs, descs.data(), n * sizeof(BrickDesc), cudaMemcpyHostToDevice,
+                        ks) != cudaSuccess ||
+        cudaMemsetAsync(d_error, 0, 8, ks) != cudaSuccess ||
+        cudaMemsetAsync(d_counts, 0, static_cast<std::size_t>(n) * kChunksPerBrick * 4, ks) !=
             cudaSuccess) {
       cleanup();
       return Status::io_error;

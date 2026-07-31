@@ -330,6 +330,40 @@ TEST(cuda_decode_handles_per_brick_tables) {
   CHECK(a.differing_fraction < 1e-4);
 }
 
+// The same, across enough bricks that the decode runs as several batches.
+//
+// This covers the configuration in which a decode failure was found that hit
+// every real scroll volume at every quality and no synthetic one: more than one
+// batch, per-brick tables, and per-brick statistics that genuinely differ, so a
+// brick decoded against a neighbour's tables diverges. The existing tests each
+// had at most two of the three. The cause was a stream-ordering violation on the
+// per-batch scratch uploads (see the comment in cuda/backend.cu), and being a
+// race it stopped reproducing before it could be A/B'd -- so this test is
+// coverage of the shape of the bug, not a deterministic reproducer of it. Do not
+// read a pass here as proof the ordering is right; read a failure as proof it is
+// not.
+TEST(cuda_decode_is_correct_across_batch_boundaries) {
+  if (!cuda_ready()) {
+    std::printf("       (no CUDA device; skipped)\n");
+    return;
+  }
+  // Three brick layers in z, so the batching splits it however the device's free
+  // memory falls out, and at least two batches on anything realistic.
+  const Volume v = heterogeneous_volume({384, 384, 384});
+  EncodeOptions opts;
+  opts.quality = 1.0f;
+  opts.effort = Effort::high;
+  opts.streams_per_brick = 16;
+  opts.per_brick_tables = true;
+
+  const Agreement a = compare_backends(v, DType::u8, opts);
+  REQUIRE(a.ok);  // a diverged decode fails here, as corrupt_bitstream
+  std::printf("       max %.0f  rms %.5f  differing %.2e\n", a.max_abs, a.rms,
+              a.differing_fraction);
+  CHECK(a.max_abs <= 1.0);
+  CHECK(a.differing_fraction < 1e-4);
+}
+
 TEST_MAIN()
 
 // DeviceVolume: the compressed archive stays in VRAM and decoding writes into

@@ -152,6 +152,54 @@ inline Volume scroll_like_volume(gpudct::Dims d, std::uint32_t seed = 11) {
   return v;
 }
 
+// A volume whose *per-brick* statistics differ sharply from brick to brick.
+//
+// Every other generator here is statistically uniform across the volume, and
+// that uniformity turned out to hide a whole class of bug. Uniform statistics
+// mean either every brick declines per-brick entropy tables or they all pick
+// effectively the same ones, so a defect in the per-brick table plumbing --
+// wrong base offset, an unordered upload, a stale batch's tables -- changes
+// nothing observable. Real scroll data is the opposite: masked-out air next to
+// dense fibre, so adjacent bricks train genuinely different tables, and a decode
+// against the wrong ones diverges immediately.
+//
+// Each brick is assigned one of three regimes at random. The dimensions passed
+// should span several bricks in z, so that a batched decode has more than one
+// batch to get wrong.
+inline Volume heterogeneous_volume(gpudct::Dims d, std::uint32_t seed = 5) {
+  Volume v = make(d);
+  Rng rng(seed);
+  constexpr std::uint32_t kB = 128;  // brick edge
+  const std::uint32_t gx = (d.x + kB - 1) / kB, gy = (d.y + kB - 1) / kB,
+                      gz = (d.z + kB - 1) / kB;
+  std::vector<std::uint8_t> regime(static_cast<std::size_t>(gx) * gy * gz);
+  for (std::uint8_t& r : regime) r = static_cast<std::uint8_t>(rng.next() % 3);
+
+  constexpr float tau = 2.0f * std::numbers::pi_v<float>;
+  for (std::uint32_t z = 0; z < d.z; ++z)
+    for (std::uint32_t y = 0; y < d.y; ++y)
+      for (std::uint32_t x = 0; x < d.x; ++x) {
+        const std::size_t bi = (static_cast<std::size_t>(z / kB) * gy + y / kB) * gx + x / kB;
+        const float fx = static_cast<float>(x), fy = static_cast<float>(y),
+                    fz = static_cast<float>(z);
+        float acc = 0.0f;
+        switch (regime[bi]) {
+          case 0:  // masked-out air: near-constant, almost every coefficient zero
+            acc = 3.0f + rng.range(-1.0f, 1.0f);
+            break;
+          case 1:  // dense fibre: a strong directional carrier
+            acc = 128.0f + 60.0f * std::sin(tau * (0.29f * fx + 0.11f * fy + 0.05f * fz)) +
+                  20.0f * std::sin(tau * 0.17f * fz) + rng.range(-8.0f, 8.0f);
+            break;
+          default:  // smooth gradient with light grain
+            acc = 40.0f + 0.35f * (fx + fy + fz) + rng.range(-3.0f, 3.0f);
+            break;
+        }
+        v.at(x, y, z) = std::fmin(255.0f, std::fmax(0.0f, acc));
+      }
+  return v;
+}
+
 // A volume built from integer arithmetic only -- no exp, sin, or any other libm
 // call.
 //
