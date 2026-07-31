@@ -13,6 +13,7 @@
 
 #include <array>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -22,6 +23,42 @@ namespace gpudct {
 
 struct Percentiles {
   double p50 = 0, p90 = 0, p95 = 0, p99 = 0, p999 = 0, p9999 = 0, max = 0;
+};
+
+// --------------------------------------------------------------------------
+// Isosurface displacement (docs/QUALITY.md section 1.3).
+//
+// The downstream task on scroll CT is tracing a papyrus sheet as an isosurface
+// and flattening it. What ruins that is not noise, it is the surface *moving*:
+// a codec can hold a fine PSNR while shifting the surface a fraction of a voxel,
+// and nothing else in this file would notice. Distances are in voxels.
+// --------------------------------------------------------------------------
+struct IsoDispStats {
+  double mean_abs = 0, p99 = 0, max_abs = 0, signed_mean = 0;
+};
+
+struct IsoDisplacement {
+  double isovalue = 0;              // the threshold actually used
+  std::uint64_t edges = 0;          // grid edges examined
+  std::uint64_t crossings = 0;      // edges crossed by both surfaces: the sample count
+  double crossing_frac = 0;         // original's crossings / edges -- surface density
+  // Edges where exactly one of the two volumes crosses, over edges where either
+  // does. The surface appeared or vanished rather than moved, which is worse
+  // than any displacement: it breaks the trace instead of bending it.
+  double topology_frac = 0;
+
+  // Shift of the crossing along the edge. This is the literal quantity, and an
+  // upper bound on how far the surface actually went: a surface oblique to the
+  // grid moves d/|n.a| along axis a for a normal displacement d. A translation
+  // of the whole volume shows up in `signed_mean`.
+  IsoDispStats axis{};
+  // The same shift projected onto the original's intensity gradient, i.e. the
+  // distance the surface moved along its own normal. Positive `signed_mean`
+  // means the surface moved towards higher intensity -- the bright side eroded.
+  // The two biases catch different things and neither subsumes the other: a
+  // translation cancels in `normal.signed_mean` over a closed surface, and a
+  // uniform erosion cancels in `axis.signed_mean`.
+  IsoDispStats normal{};
 };
 
 struct Metrics {
@@ -61,6 +98,9 @@ struct Metrics {
   // removing signal, not noise -- visible here long before it reaches PSNR.
   std::array<double, 3> error_autocorr{};
   double hist_emd = 0;
+  // How far the isosurface moved. The metric that corresponds to "does the
+  // segmentation still land in the same place".
+  IsoDisplacement iso{};
 
   // --- anisotropy: a separable 3D transform can fail on one axis only, and
   // slice-wise viewing hides it completely ---
@@ -77,8 +117,24 @@ struct Metrics {
 };
 
 // orig and dec are the two volumes as f32, both dims.voxels() long.
-[[nodiscard]] Metrics compute_metrics(const float* orig, const float* dec, Dims dims,
-                                      DType dtype);
+//
+// `isovalue` picks the surface for the displacement metric. The default, NaN,
+// takes Otsu's threshold on the *original* -- never on the decoded volume, or
+// the metric would move its own goalposts with the rate.
+[[nodiscard]] Metrics compute_metrics(
+    const float* orig, const float* dec, Dims dims, DType dtype,
+    double isovalue = std::numeric_limits<double>::quiet_NaN());
+
+// Otsu's threshold over a 256-bin histogram of the data range. Scroll CT is
+// bimodal -- air and papyrus -- and this lands in the valley between the two
+// modes, which is where a human tracing a sheet puts it.
+[[nodiscard]] double otsu_threshold(const float* v, std::size_t n);
+
+// Displacement of the `isovalue` isosurface between orig and dec, in voxels.
+// NaN takes Otsu's threshold on `orig`. Allocates two histograms and nothing
+// else: the volumes are gigabytes and this streams over them twice.
+[[nodiscard]] IsoDisplacement isosurface_displacement(const float* orig, const float* dec,
+                                                      Dims dims, double isovalue);
 
 // Exact absolute-error percentiles. Two passes and a histogram, no sampling and
 // no sketch: the reported value is a value that actually occurs in the data.

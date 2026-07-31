@@ -373,9 +373,250 @@ void local_std_error(const float* a, const float* b, Dims d, double& p50, double
   p99 = pick(0.99);
 }
 
+// --------------------------------------------------------------------------
+// Isosurface displacement.
+//
+// Sub-voxel geometry out of the samples we already have: a grid edge whose two
+// endpoints straddle the isovalue carries the surface at the linearly
+// interpolated crossing, and coding error moves that crossing. Nothing is
+// meshed. Marching cubes would put its own interpolation between us and the
+// quantity we are trying to measure, and would cost a surface's worth of memory
+// per volume to do it.
+//
+// Edges within one voxel of the volume boundary are skipped: the central
+// difference that gives the normal is one-sided there, and a wrong normal is
+// worse than a missing sample. On 512^3 that discards 1.2% of edges.
+// --------------------------------------------------------------------------
+constexpr std::size_t kIsoBins = 1u << 20;
+
+// Both displacements live in (-1, 1) by construction -- the two crossings share
+// one edge -- so the bin edges are fixed rather than normalized against an
+// observed maximum, which is what buys this metric two passes instead of three.
+[[nodiscard]] inline std::size_t iso_bin(double abs_disp) {
+  const std::size_t b = static_cast<std::size_t>(abs_disp * static_cast<double>(kIsoBins));
+  return std::min(b, kIsoBins - 1);
+}
+
+// Visits every interior grid edge that either surface crosses, calling
+// cb(orig_crosses, dec_crosses, vanished, axis_disp, normal_disp).
+//
+// The displacements are meaningful only when both cross. When exactly one does,
+// the surface either moved off the end of this edge or is genuinely not here,
+// and `vanished` distinguishes them by asking whether the other volume crosses
+// either neighbouring edge along the same axis. That test is not optional
+// polish: without it a sub-voxel wobble reports as a topology change on a fifth
+// of the surface, since every crossing that slides past a voxel centre leaves
+// one edge and enters the next. Three edges cover any motion up to one voxel,
+// which is also the point past which "moved" stops being the honest word.
+template <typename F>
+void scan_iso_edges(const float* orig, const float* dec, Dims d, double iso, F&& cb) {
+  const std::uint32_t lim[3] = {d.x, d.y, d.z};
+  if (lim[0] < 3 || lim[1] < 3 || lim[2] < 3) return;
+
+  for (int ax = 0; ax < 3; ++ax)
+    for (std::uint32_t z = 1; z + 1 < d.z; ++z)
+      for (std::uint32_t y = 1; y + 1 < d.y; ++y)
+        for (std::uint32_t x = 1; x + 1 < d.x; ++x) {
+          const std::uint32_t p[3] = {x, y, z};
+          // The edge runs p -> q along ax and the normal stencil reaches one
+          // further at each end, so p has to leave room for both.
+          if (p[static_cast<std::size_t>(ax)] + 2 >= lim[static_cast<std::size_t>(ax)]) continue;
+          std::uint32_t q[3] = {x, y, z};
+          ++q[static_cast<std::size_t>(ax)];
+
+          const std::size_t ip = idx_of(d, p[0], p[1], p[2]);
+          const std::size_t iq = idx_of(d, q[0], q[1], q[2]);
+          const double ao = static_cast<double>(orig[ip]) - iso;
+          const double bo = static_cast<double>(orig[iq]) - iso;
+          const double ad = static_cast<double>(dec[ip]) - iso;
+          const double bd = static_cast<double>(dec[iq]) - iso;
+          // A sample exactly on the isovalue counts as inside. Any convention
+          // does, as long as it is the same one on both volumes: an
+          // inconsistent one invents topology changes on flat regions.
+          const bool oc = (ao < 0.0) != (bo < 0.0);
+          const bool dc = (ad < 0.0) != (bd < 0.0);
+          if (!oc && !dc) continue;
+
+          double disp = 0.0, normal_disp = 0.0;
+          if (oc && dc) {
+            disp = (-ad / (bd - ad)) - (-ao / (bo - ao));
+            // Unit normal of the *original* surface, from a central difference
+            // averaged over the two endpoints. A surface displaced by t along
+            // its normal moves t/|n.a| along axis a, so projecting back onto n
+            // recovers the distance the surface actually travelled and takes
+            // the grid orientation out of the number.
+            double g[3];
+            for (int i = 0; i < 3; ++i) {
+              std::int64_t lo0[3] = {p[0], p[1], p[2]}, hi0[3] = {p[0], p[1], p[2]};
+              std::int64_t lo1[3] = {q[0], q[1], q[2]}, hi1[3] = {q[0], q[1], q[2]};
+              --lo0[i]; ++hi0[i];
+              --lo1[i]; ++hi1[i];
+              g[i] = 0.25 * (static_cast<double>(sample(orig, d, hi0[0], hi0[1], hi0[2])) -
+                             sample(orig, d, lo0[0], lo0[1], lo0[2]) +
+                             sample(orig, d, hi1[0], hi1[1], hi1[2]) -
+                             sample(orig, d, lo1[0], lo1[1], lo1[2]));
+            }
+            const double gm = std::sqrt(g[0] * g[0] + g[1] * g[1] + g[2] * g[2]);
+            if (gm > 0.0) normal_disp = disp * g[static_cast<std::size_t>(ax)] / gm;
+          }
+          cb(oc, dc, disp, normal_disp);
+        }
+}
+
+// The bin holding the p99 and the rank within it. Pass 2 then sorts that one
+// bin, which is the same exactness bargain exact_abs_percentiles makes.
+struct IsoBinTarget {
+  std::size_t bin = 0;
+  std::uint64_t rank = 1;
+};
+
+[[nodiscard]] IsoBinTarget locate_p99(const std::vector<std::uint64_t>& h, std::uint64_t n) {
+  IsoBinTarget t;
+  std::uint64_t want = static_cast<std::uint64_t>(std::ceil(0.99 * static_cast<double>(n)));
+  want = std::clamp<std::uint64_t>(want, 1, n);
+  std::uint64_t acc = 0;
+  for (std::size_t b = 0; b < h.size(); ++b) {
+    if (acc + h[b] >= want) {
+      t.bin = b;
+      t.rank = want - acc;
+      return t;
+    }
+    acc += h[b];
+  }
+  t.bin = h.size() - 1;
+  return t;
+}
+
 }  // namespace
 
-Metrics compute_metrics(const float* orig, const float* dec, Dims dims, DType dtype) {
+double otsu_threshold(const float* v, std::size_t n) {
+  if (n == 0) return 0.0;
+  double lo = v[0], hi = v[0];
+  for (std::size_t i = 0; i < n; ++i) {
+    lo = std::min<double>(lo, v[i]);
+    hi = std::max<double>(hi, v[i]);
+  }
+  if (!(hi > lo)) return lo;
+
+  constexpr int kNB = 256;
+  const double w = (hi - lo) / kNB;
+  std::array<double, kNB> h{};
+  for (std::size_t i = 0; i < n; ++i) {
+    const int b = std::clamp(static_cast<int>((static_cast<double>(v[i]) - lo) / w), 0, kNB - 1);
+    h[static_cast<std::size_t>(b)] += 1.0;
+  }
+
+  double moment = 0;
+  for (int i = 0; i < kNB; ++i) moment += i * h[static_cast<std::size_t>(i)];
+
+  double wb = 0, mb = 0, best = -1;
+  int split = 0;
+  for (int i = 0; i < kNB; ++i) {
+    wb += h[static_cast<std::size_t>(i)];
+    mb += i * h[static_cast<std::size_t>(i)];
+    const double wf = static_cast<double>(n) - wb;
+    if (wb <= 0 || wf <= 0) continue;
+    const double diff = mb / wb - (moment - mb) / wf;
+    const double var = wb * wf * diff * diff;  // between-class variance, unnormalized
+    if (var > best) {
+      best = var;
+      split = i;
+    }
+  }
+  // `split` is the last bin of the low class, so the threshold is its far edge.
+  return lo + (static_cast<double>(split) + 1.0) * w;
+}
+
+IsoDisplacement isosurface_displacement(const float* orig, const float* dec, Dims dims,
+                                        double isovalue) {
+  IsoDisplacement r;
+  const std::size_t n = dims.voxels();
+  if (n == 0) return r;
+  r.isovalue = std::isfinite(isovalue) ? isovalue : otsu_threshold(orig, n);
+
+  const std::uint32_t lim[3] = {dims.x, dims.y, dims.z};
+  for (int ax = 0; ax < 3; ++ax) {
+    std::uint64_t e = (lim[static_cast<std::size_t>(ax)] >= 4)
+                          ? lim[static_cast<std::size_t>(ax)] - 3
+                          : 0;
+    for (int i = 0; i < 3; ++i)
+      if (i != ax)
+        e *= (lim[static_cast<std::size_t>(i)] >= 3) ? lim[static_cast<std::size_t>(i)] - 2 : 0;
+    r.edges += e;
+  }
+  if (r.edges == 0) return r;
+
+  std::vector<std::uint64_t> ha(kIsoBins, 0), hn(kIsoBins, 0);
+  double sum_a = 0, sgn_a = 0, sum_n = 0, sgn_n = 0;
+  std::uint64_t both = 0, only_one = 0, orig_cross = 0;
+  scan_iso_edges(orig, dec, dims, r.isovalue,
+                 [&](bool oc, bool dc, double disp, double normal_disp) {
+                   if (oc) ++orig_cross;
+                   if (oc != dc) {
+                     ++only_one;
+                     return;
+                   }
+                   ++both;
+                   const double aa = std::fabs(disp), an = std::fabs(normal_disp);
+                   sum_a += aa;
+                   sgn_a += disp;
+                   sum_n += an;
+                   sgn_n += normal_disp;
+                   r.axis.max_abs = std::max(r.axis.max_abs, aa);
+                   r.normal.max_abs = std::max(r.normal.max_abs, an);
+                   ++ha[iso_bin(aa)];
+                   ++hn[iso_bin(an)];
+                 });
+
+  r.crossings = both;
+  r.crossing_frac = static_cast<double>(orig_cross) / static_cast<double>(r.edges);
+  r.topology_frac = (both + only_one > 0) ? static_cast<double>(only_one) /
+                                                static_cast<double>(both + only_one)
+                                          : 0.0;
+  if (both == 0) return r;
+  const double bn = static_cast<double>(both);
+  r.axis.mean_abs = sum_a / bn;
+  r.axis.signed_mean = sgn_a / bn;
+  r.normal.mean_abs = sum_n / bn;
+  r.normal.signed_mean = sgn_n / bn;
+
+  const IsoBinTarget ta = locate_p99(ha, both), tn = locate_p99(hn, both);
+  // A bin 2^-20 voxels wide holding millions of crossings only happens when the
+  // two volumes are near-identical and everything piles into bin 0. Sorting
+  // 32 MiB of values to resolve a number already known to a millionth of a voxel
+  // is not a trade worth making, so the bin edge is reported instead.
+  constexpr std::uint64_t kExactCap = 1u << 22;
+  const bool collect_a = ha[ta.bin] <= kExactCap;
+  const bool collect_n = hn[tn.bin] <= kExactCap;
+  r.axis.p99 = static_cast<double>(ta.bin) / static_cast<double>(kIsoBins);
+  r.normal.p99 = static_cast<double>(tn.bin) / static_cast<double>(kIsoBins);
+  ha.clear();
+  ha.shrink_to_fit();
+  hn.clear();
+  hn.shrink_to_fit();
+
+  if (collect_a || collect_n) {
+    std::vector<double> va, vn;
+    scan_iso_edges(orig, dec, dims, r.isovalue,
+                   [&](bool oc, bool dc, double disp, double normal_disp) {
+                     if (oc != dc) return;
+                     const double aa = std::fabs(disp), an = std::fabs(normal_disp);
+                     if (collect_a && iso_bin(aa) == ta.bin) va.push_back(aa);
+                     if (collect_n && iso_bin(an) == tn.bin) vn.push_back(an);
+                   });
+    auto pick = [](std::vector<double>& v, std::uint64_t rank, double fallback) {
+      if (v.empty()) return fallback;
+      std::sort(v.begin(), v.end());
+      return v[std::min<std::size_t>(static_cast<std::size_t>(rank) - 1, v.size() - 1)];
+    };
+    if (collect_a) r.axis.p99 = pick(va, ta.rank, r.axis.p99);
+    if (collect_n) r.normal.p99 = pick(vn, tn.rank, r.normal.p99);
+  }
+  return r;
+}
+
+Metrics compute_metrics(const float* orig, const float* dec, Dims dims, DType dtype,
+                        double isovalue) {
   Metrics m;
   const std::size_t n = dims.voxels();
   m.voxels = n;
@@ -432,6 +673,7 @@ Metrics compute_metrics(const float* orig, const float* dec, Dims dims, DType dt
   }
   band_energy(orig, dec, dims, m.band_energy_ratio);
   local_std_error(orig, dec, dims, m.local_std_err_p50, m.local_std_err_p99);
+  m.iso = isosurface_displacement(orig, dec, dims, isovalue);
 
   // Error autocorrelation at lag 1 along each axis. White noise is what a good
   // codec leaves behind; structure here means we removed signal.
@@ -637,6 +879,16 @@ std::string format_report(const Metrics& m, bool verbose) {
        m.band_energy_ratio[3]);
   line("  local std err      p50 %.5f  p99 %.5f\n", m.local_std_err_p50, m.local_std_err_p99);
   line("  hist emd           %12.6f\n", m.hist_emd);
+  // Voxels, not input units: this is a distance, and it is the one number here
+  // that says whether a traced sheet still lands in the same place.
+  line("  isosurface at      %12.4f  (crosses %.3f%% of edges)\n", m.iso.isovalue,
+       100.0 * m.iso.crossing_frac);
+  line("    along edge       mean %.5f  p99 %.5f  max %.5f  bias %+.6f\n", m.iso.axis.mean_abs,
+       m.iso.axis.p99, m.iso.axis.max_abs, m.iso.axis.signed_mean);
+  line("    along normal     mean %.5f  p99 %.5f  max %.5f  bias %+.6f\n",
+       m.iso.normal.mean_abs, m.iso.normal.p99, m.iso.normal.max_abs,
+       m.iso.normal.signed_mean);
+  line("    topology change  %.6f of surface edges\n", m.iso.topology_frac);
 
   if (verbose) {
     head("anisotropy\n");

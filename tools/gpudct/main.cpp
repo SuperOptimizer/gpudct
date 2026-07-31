@@ -5,6 +5,7 @@
 #include <memory>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -58,6 +59,12 @@ compression options:
                    0 disables. Implies --deblock when > 0.
   --reps N         bench: repeat each point N times and keep the best
 
+metrics and eval options:
+  --iso V          isovalue for the isosurface displacement metric, in input
+                   units. The default is Otsu's threshold on the original,
+                   which on scroll CT lands in the valley between air and
+                   papyrus; the value used is always reported.
+
 structure:
   chunk 16^3 (transform unit), brick 128^3 (entropy and random-access unit)
 )");
@@ -78,6 +85,9 @@ struct Args {
   float deadzone = -1.0f;  // <0 = profile default
   float qshape = -1.0f;    // <0 = profile default (radial exponent b)
   float qamp = -1.0f;      // <0 = profile default (radial amplitude a)
+  // NaN = Otsu on the original. 0 is a legitimate isovalue, so it cannot be the
+  // sentinel.
+  double iso = std::numeric_limits<double>::quiet_NaN();
 };
 
 bool parse(int argc, char** argv, Args& a) {
@@ -149,6 +159,10 @@ bool parse(int argc, char** argv, Args& a) {
       const char* v = next("--qshape");
       if (!v) return false;
       a.qshape = std::strtof(v, nullptr);
+    } else if (s == "--iso") {
+      const char* v = next("--iso");
+      if (!v) return false;
+      a.iso = std::strtod(v, nullptr);
     } else if (s == "--max-abs") {
       const char* v = next("--max-abs");
       if (!v) return false;
@@ -442,8 +456,9 @@ int cmd_eval(const Args& a) {
   std::printf("%s  %ux%ux%u %s  (%.1f MiB)\n", a.in.c_str(), a.dims.x, a.dims.y, a.dims.z,
               std::string(dtype_name(a.dtype)).c_str(),
               static_cast<double>(raw.size()) / 1048576.0);
-  std::printf("%-9s %-7s %8s %7s %8s %8s %7s %6s %6s %6s %6s %s\n", "profile", "qual", "ratio",
-              "bpv", "psnr", "ssim3d", "mae", "p95", "p99", "p999", "max", "band energy lo->hi");
+  std::printf("%-9s %-7s %8s %7s %8s %8s %7s %6s %6s %6s %6s %7s %s\n", "profile", "qual",
+              "ratio", "bpv", "psnr", "ssim3d", "mae", "p95", "p99", "p999", "max", "isodisp",
+              "band energy lo->hi");
 
   // An explicit --profile narrows the sweep to that one curve. Tuning runs read
   // a single profile and the other two triple their cost for nothing.
@@ -471,15 +486,19 @@ int cmd_eval(const Args& a) {
       if (decode(archive, dopts, out, info, a.backend) != Status::ok) continue;
 
       const std::vector<float> dec = to_float(out.data(), a.dtype, a.dims.voxels());
-      Metrics m = compute_metrics(orig.data(), dec.data(), a.dims, a.dtype);
+      Metrics m = compute_metrics(orig.data(), dec.data(), a.dims, a.dtype, a.iso);
       m.ratio = static_cast<double>(raw.size()) / static_cast<double>(archive.size());
       m.bits_per_voxel =
           8.0 * static_cast<double>(archive.size()) / static_cast<double>(a.dims.voxels());
 
-      std::printf("%-9s %-7.3f %7.2fx %7.4f %8.2f %8.5f %7.3f %6.0f %6.0f %6.0f %6.0f  %.2f %.2f %.2f %.2f\n",
+      // isodisp is the mean displacement along the surface normal, in voxels:
+      // the column that says whether a traced sheet still lands in the same
+      // place, which none of the others do.
+      std::printf("%-9s %-7.3f %7.2fx %7.4f %8.2f %8.5f %7.3f %6.0f %6.0f %6.0f %6.0f %7.4f  %.2f %.2f %.2f %.2f\n",
                   std::string(profile_name(p)).c_str(), static_cast<double>(q), m.ratio,
                   m.bits_per_voxel, m.psnr_range, m.ssim, m.mae, m.abs_err.p95, m.abs_err.p99,
-                  m.abs_err.p999, m.abs_err.max, m.band_energy_ratio[0], m.band_energy_ratio[1],
+                  m.abs_err.p999, m.abs_err.max, m.iso.normal.mean_abs,
+                  m.band_energy_ratio[0], m.band_energy_ratio[1],
                   m.band_energy_ratio[2], m.band_energy_ratio[3]);
     }
   }
@@ -501,7 +520,7 @@ int cmd_metrics(const Args& a) {
   }
   const std::vector<float> fa = to_float(ba.data(), a.dtype, a.dims.voxels());
   const std::vector<float> fb = to_float(bb.data(), a.dtype, a.dims.voxels());
-  const Metrics m = compute_metrics(fa.data(), fb.data(), a.dims, a.dtype);
+  const Metrics m = compute_metrics(fa.data(), fb.data(), a.dims, a.dtype, a.iso);
   std::printf("%s", format_report(m, true).c_str());
 
   const std::vector<BrickScore> worst = worst_bricks(fa.data(), fb.data(), a.dims, 10);

@@ -57,9 +57,12 @@ PSNR is a poor proxy for that, so:
 - **Local-variance preservation** — error in per-8³-block standard deviation, reported
   as a map and as p50/p99. Catches the specific failure where flat regions are perfect
   and textured regions are mush, which whole-volume PSNR averages away.
-- **Isosurface displacement** — for a set of thresholds spanning the histogram, the
-  Hausdorff and mean displacement of the extracted isosurface. This is the metric that
-  actually corresponds to "does the segmentation still land in the same place".
+- **Isosurface displacement** — how far the isosurface moved, in voxels. This is the
+  metric that actually corresponds to "does the segmentation still land in the same
+  place", and it is the one the others cannot stand in for: a codec can hold a fine
+  PSNR while shifting a sheet a fraction of a voxel, and bias accumulates along a
+  traced sheet in a way that jitter does not. Implemented; see below for what it
+  reports and what it measures on real data.
 - **Error autocorrelation** — the error field should look like white noise. Structured
   (spatially correlated) error means we're removing *signal*, not noise, and shows up
   here long before it shows up in PSNR.
@@ -1181,3 +1184,47 @@ already where the renderer wants them -- and freeing the CPU while it happens.
 Measured against those goals it is worth having. Measured as a throughput
 accelerator it is not, and no amount of kernel tuning changes that; it would take
 a different entropy layer.
+
+### Isosurface displacement, measured
+
+The metric walks every grid edge, finds where the original crosses the isovalue by
+linear interpolation between the two samples, finds where the reconstruction crosses
+the same edge, and reports the distance between them. Four numbers, and the last two
+are the ones that matter:
+
+- **along edge** — the raw shift of the crossing along the axis. This is an *upper
+  bound* on how far the surface moved: a surface oblique to the axis reads a larger
+  shift along the edge than it actually travelled.
+- **along normal** — the same shift projected onto the surface normal, estimated from
+  the original's gradient. This is the honest displacement.
+- **bias** (the signed mean) — a surface that consistently moves one way is far worse
+  than one that jitters, because bias accumulates over a traced sheet while jitter
+  averages out. This is why a signed mean is reported alongside the absolute one.
+- **topology change** — edges where exactly one of the two volumes crosses, over edges
+  where either does. The surface appeared or vanished rather than moved, which breaks
+  a trace instead of bending it.
+
+The isovalue defaults to Otsu's threshold on the *original*, which on scroll CT lands
+in the valley between air and papyrus, and is always reported. `--iso V` overrides it.
+
+Measured on a 512³ real scroll volume, balanced profile, deblocking on. Otsu picked
+77.70, crossing 15.6% of edges:
+
+| quality | archive | PSNR | normal mean | normal p99 | bias | topology |
+|---|---|---|---|---|---|---|
+| 0.25 | 9.3 MB | 26.7 dB | 0.097 vx | 0.405 vx | **-0.0186** | 0.442 |
+| 1 | 31.0 MB | 34.7 dB | 0.040 vx | 0.188 vx | -0.0066 | 0.182 |
+| 4 | 62.5 MB | 45.7 dB | 0.011 vx | 0.060 vx | -0.0017 | 0.049 |
+
+Two things worth recording. Displacement falls roughly with the quantizer, as it
+should. But the **bias is consistently negative at every rate** — the surface moves
+inward, toward the low side of the isovalue, and at q=0.25 by nearly 2% of a voxel on
+average. That is a systematic direction, not noise, and it is exactly the failure mode
+PSNR cannot see. It is small enough not to be alarming and consistent enough to be
+real; whether it comes from the dead-zone quantizer (which biases coefficients toward
+zero, and so biases reconstruction toward the local mean) has not been established.
+That is the obvious hypothesis and it is untested.
+
+The topology fraction at q=0.25 — 44% of surface edges gaining or losing a crossing —
+is the number that should discourage using that rate for segmentation work, and it is
+far more legible than "26.7 dB".
