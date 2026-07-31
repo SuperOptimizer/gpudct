@@ -11,7 +11,7 @@ add_library(gpudct
 )
 
 target_include_directories(gpudct
-  PUBLIC  ${CMAKE_SOURCE_DIR}/include
+  PUBLIC  ${PROJECT_SOURCE_DIR}/include
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
